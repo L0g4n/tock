@@ -1,3 +1,4 @@
+pub mod app;
 pub mod cdc;
 pub mod descriptors;
 pub mod usb_ctap;

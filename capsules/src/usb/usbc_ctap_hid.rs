@@ -1,5 +1,6 @@
 //! A USB HID client of the USB hardware interface
 
+use super::app::App;
 use super::descriptors;
 use super::descriptors::Buffer64;
 use super::descriptors::DescriptorType;
@@ -261,7 +262,7 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> ClientCtapHID<'a, 'b, C> {
         }
     }
 
-    pub fn receive_packet(&'a self) -> bool {
+    pub fn receive_packet(&'a self, app: &mut App) -> bool {
         if self.pending_out.get() {
             // The previous packet has not yet been received, reject the new one.
             false
@@ -271,7 +272,7 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> ClientCtapHID<'a, 'b, C> {
             // Otherwise, there's nothing to do, the controller will send us a packet_out when a
             // packet arrives.
             if self.delayed_out.take() {
-                if self.send_packet_to_client() {
+                if self.send_packet_to_client(Some(app)) {
                     // If that succeeds, alert the controller that we can now
                     // receive data on the Interrupt OUT endpoint.
                     self.controller().endpoint_resume_out(1);
@@ -284,7 +285,7 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> ClientCtapHID<'a, 'b, C> {
     // Send an OUT packet available in the controller back to the client.
     // This returns false if the client is not ready to receive a packet, and true if the client
     // successfully accepted the packet.
-    fn send_packet_to_client(&'a self) -> bool {
+    fn send_packet_to_client(&'a self, app: Option<&mut App>) -> bool {
         // Copy the packet into a buffer to send to the client.
         let mut buf: [u8; 64] = [0; 64];
         for (i, x) in self.out_buffer.buf.iter().enumerate() {
@@ -296,7 +297,7 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> ClientCtapHID<'a, 'b, C> {
         // Notify the client
         if self
             .client
-            .map_or(false, |client| client.can_receive_packet())
+            .map_or(false, |client| client.can_receive_packet(&app))
         {
             assert!(self.pending_out.take());
 
@@ -305,7 +306,7 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> ClientCtapHID<'a, 'b, C> {
             // should be re-transmitted or not.
             self.cancel_in_transaction();
 
-            self.client.map(|client| client.packet_received(&buf));
+            self.client.map(|client| client.packet_received(&buf, app));
             true
         } else {
             // Cannot receive now, indicate a delay to the controller.
@@ -425,7 +426,7 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> hil::usb::Client<'a> for ClientCtap
                     // Cannot process this packet
                     hil::usb::OutResult::Error
                 } else {
-                    if self.send_packet_to_client() {
+                    if self.send_packet_to_client(None) {
                         hil::usb::OutResult::Ok
                     } else {
                         hil::usb::OutResult::Delay

@@ -1,6 +1,7 @@
+use super::app::{App, Side};
 use super::usbc_ctap_hid::ClientCtapHID;
 use kernel::errorcode::ErrorCode;
-use kernel::grant::{AllowRoCount, AllowRwCount, Grant, UpcallCount};
+use kernel::grant::{AllowRoCount, AllowRwCount, Grant, GrantKernelData, UpcallCount};
 use kernel::hil;
 use kernel::hil::usb::Client;
 use kernel::processbuffer::{ReadableProcessBuffer, WriteableProcessBuffer};
@@ -35,71 +36,15 @@ pub const CTAP_CALLBACK_RECEIVED_SUBSCRIBE_NUM: usize = 1;
 
 type CtabUsbDriverGrant = Grant<App, UpcallCount<2>, AllowRoCount<1>, AllowRwCount<1>>;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Side {
-    Transmit,
-    Receive,
-    TransmitOrReceive,
-}
-
-impl Side {
-    fn can_transmit(&self) -> bool {
-        match self {
-            Side::Transmit | Side::TransmitOrReceive => true,
-            Side::Receive => false,
-        }
-    }
-
-    fn can_receive(&self) -> bool {
-        match self {
-            Side::Receive | Side::TransmitOrReceive => true,
-            Side::Transmit => false,
-        }
-    }
-}
-
-#[derive(Default)]
-pub struct App {
-    // Only one app can be connected to this driver, to avoid needing to route packets among apps.
-    // This field tracks this status.
-    connected: bool,
-    // Currently enabled transaction side. Subscribing to a callback or allowing a buffer
-    // automatically sets the corresponding side. Clearing both the callback and the buffer resets
-    // the side to None.
-    side: Option<Side>,
-    // Whether the app is waiting for the kernel signaling a packet transfer.
-    waiting: bool,
-}
-
-impl App {
-    fn check_side(&mut self) {
-        if !self.waiting {
-            self.side = None;
-        }
-    }
-
-    fn set_side(&mut self, side: Side) -> bool {
-        match self.side {
-            None => {
-                self.side = Some(side);
-                true
-            }
-            Some(app_side) => side == app_side,
-        }
-    }
-
-    fn is_ready_for_command(&self, side: Side) -> bool {
-        self.side == Some(side)
-    }
-}
-
 pub trait CtapUsbClient {
     // Whether this client is ready to receive a packet. This must be checked before calling
-    // packet_received().
-    fn can_receive_packet(&self) -> bool;
+    // packet_received(). If App is not supplied, it will be found from the implemntation's
+    // members.
+    fn can_receive_packet(&self, app: &Option<&mut App>) -> bool;
 
     // Signal to the client that a packet has been received.
-    fn packet_received(&self, packet: &[u8; 64]);
+    // If App is not supplied, it will be found from the implementation's members.
+    fn packet_received(&self, packet: &[u8; 64], app: Option<&mut App>);
 
     // Signal to the client that a packet has been transmitted.
     fn packet_transmitted(&self);
@@ -114,47 +59,54 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> CtapUsbSyscallDriver<'a, 'b, C> {
     pub fn new(usb_client: &'a ClientCtapHID<'a, 'b, C>, apps: CtabUsbDriverGrant) -> Self {
         CtapUsbSyscallDriver { usb_client, apps }
     }
+
+    fn app_packet_received(&self, packet: &[u8; 64], app: &mut App, kernel_data: &GrantKernelData) {
+        if app.connected && app.waiting && app.side.map_or(false, |side| side.can_receive()) {
+            kernel_data
+                .get_readwrite_processbuffer(1)
+                .and_then(|process_buffer| {
+                    process_buffer
+                        .mut_enter(|buf| buf.copy_from_slice(packet))
+                        .unwrap();
+                    app.waiting = false;
+                    // Signal to the app that a packet is ready.
+                    kernel_data
+                        .schedule_upcall(CTAP_CALLBACK_RECEIVED_SUBSCRIBE_NUM, (0, 0, 0))
+                        .unwrap();
+                    // reset the client state
+                    app.check_side();
+
+                    Ok(())
+                })
+                .unwrap();
+        }
+    }
 }
 
 impl<'a, 'b, C: hil::usb::UsbController<'a>> CtapUsbClient for CtapUsbSyscallDriver<'a, 'b, C> {
-    fn can_receive_packet(&self) -> bool {
+    fn can_receive_packet(&self, app: &Option<&mut App>) -> bool {
         let mut result = false;
-        for app in self.apps.iter() {
-            app.enter(|app, _| {
-                if app.connected {
-                    result = app.waiting && app.side.map_or(false, |side| side.can_receive());
+        match app {
+            None => {
+                for app in self.apps.iter() {
+                    app.enter(|a, _| {
+                        if a.connected {
+                            result = a.can_receive_packet();
+                        }
+                    })
                 }
-            });
+            }
+            Some(a) => result = a.can_receive_packet(),
         }
         result
     }
 
-    fn packet_received(&self, packet: &[u8; 64]) {
+    // TODO: interface weird. we need the reentry to get the kernel data
+    fn packet_received(&self, packet: &[u8; 64], _app: Option<&mut App>) {
         for app in self.apps.iter() {
-            app.enter(|app, kernel_data| {
-                if app.connected && app.waiting && app.side.map_or(false, |side| side.can_receive())
-                {
-                    kernel_data
-                        .get_readwrite_processbuffer(1)
-                        .and_then(|process_buffer| {
-                            process_buffer
-                                .mut_enter(|buf| buf.copy_from_slice(packet))
-                                .unwrap();
-                            app.waiting = false;
-                            // Signal to the app that a packet is ready.
-                            kernel_data
-                                .schedule_upcall(CTAP_CALLBACK_RECEIVED_SUBSCRIBE_NUM, (0, 0, 0))
-                                .unwrap();
-                            // reset the client state
-                            app.check_side();
-
-                            Ok(())
-                        })
-                } else {
-                    Err(kernel::process::Error::KernelError)
-                }
+            app.enter(|a, kernel_data| {
+                self.app_packet_received(packet, a, kernel_data);
             })
-            .unwrap();
         }
     }
 
@@ -269,7 +221,7 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> SyscallDriver for CtapUsbSyscallDri
                                 CommandReturn::failure(ErrorCode::ALREADY)
                             } else {
                                 app.waiting = true;
-                                self.usb_client.receive_packet();
+                                self.usb_client.receive_packet(app);
                                 CommandReturn::success()
                             }
                         } else {
@@ -295,7 +247,7 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> SyscallDriver for CtapUsbSyscallDri
                             } else {
                                 // Indicates to the driver that we can receive any pending packet.
                                 app.waiting = true;
-                                self.usb_client.receive_packet();
+                                self.usb_client.receive_packet(app);
 
                                 if !app.waiting {
                                     // The call to receive_packet() collected a pending packet.
