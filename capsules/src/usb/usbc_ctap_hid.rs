@@ -44,8 +44,33 @@ static CTAP_REPORT_DESCRIPTOR: &'static [u8] = &[
     0xC0, // HID_EndCollection
 ];
 
+#[cfg(feature = "vendor_hid")]
+static VENDOR_REPORT_DESCRIPTOR: &'static [u8] = &[
+    0x06, 0x00, 0xFF, // HID_UsagePage ( VENDOR ),
+    0x09, 0x01, // HID_Usage ( Unused ),
+    0xA1, 0x01, // HID_Collection ( HID_Application ),
+    0x09, 0x20, // HID_Usage ( FIDO_USAGE_DATA_IN ),
+    0x15, 0x00, // HID_LogicalMin ( 0 ),
+    0x26, 0xFF, 0x00, // HID_LogicalMaxS ( 0xff ),
+    0x75, 0x08, // HID_ReportSize ( 8 ),
+    0x95, 0x40, // HID_ReportCount ( HID_INPUT_REPORT_BYTES ),
+    0x81, 0x02, // HID_Input ( HID_Data | HID_Absolute | HID_Variable ),
+    0x09, 0x21, // HID_Usage ( FIDO_USAGE_DATA_OUT ),
+    0x15, 0x00, // HID_LogicalMin ( 0 ),
+    0x26, 0xFF, 0x00, // HID_LogicalMaxS ( 0xff ),
+    0x75, 0x08, // HID_ReportSize ( 8 ),
+    0x95, 0x40, // HID_ReportCount ( HID_OUTPUT_REPORT_BYTES ),
+    0x91, 0x02, // HID_Output ( HID_Data | HID_Absolute | HID_Variable ),
+    0xC0, // HID_EndCollection
+];
+
 static CTAP_REPORT: ReportDescriptor<'static> = ReportDescriptor {
     desc: CTAP_REPORT_DESCRIPTOR,
+};
+
+#[cfg(feature = "vendor_hid")]
+static VENDOR_REPORT: ReportDescriptor<'static> = ReportDescriptor {
+    desc: VENDOR_REPORT_DESCRIPTOR,
 };
 
 static HID_SUB_DESCRIPTORS: &'static [HIDSubordinateDescriptor] = &[HIDSubordinateDescriptor {
@@ -53,10 +78,24 @@ static HID_SUB_DESCRIPTORS: &'static [HIDSubordinateDescriptor] = &[HIDSubordina
     len: CTAP_REPORT_DESCRIPTOR.len() as u16,
 }];
 
+#[cfg(feature = "vendor_hid")]
+static VENDOR_HID_SUB_DESCRIPTORS: &'static [HIDSubordinateDescriptor] =
+    &[HIDSubordinateDescriptor {
+        typ: DescriptorType::Report,
+        len: VENDOR_REPORT_DESCRIPTOR.len() as u16,
+    }];
+
 static HID: HIDDescriptor<'static> = HIDDescriptor {
     hid_class: 0x0110,
     country_code: HIDCountryCode::NotSupported,
     sub_descriptors: HID_SUB_DESCRIPTORS,
+};
+
+#[cfg(feature = "vendor_hid")]
+static VENDOR_HID: HIDDescriptor<'static> = HIDDescriptor {
+    hid_class: 0x0110,
+    country_code: HIDCountryCode::NotSupported,
+    sub_descriptors: VENDOR_HID_SUB_DESCRIPTORS,
 };
 
 pub struct ClientCtapHID<'a, 'b, C: 'a> {
@@ -82,6 +121,9 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> ClientCtapHID<'a, 'b, C> {
         product_id: u16,
         strings: &'static [&'static str],
     ) -> Self {
+        #[cfg(feature = "vendor_hid")]
+        debug!("vendor_hid enabled.");
+
         let interfaces: &mut [InterfaceDescriptor] = &mut [
             // Interface declared in the FIDO2 specification, section 8.1.8.1
             InterfaceDescriptor {
@@ -90,28 +132,62 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> ClientCtapHID<'a, 'b, C> {
                 interface_protocol: 0x00,
                 ..InterfaceDescriptor::default()
             },
+            // Vendor HID interface.
+            #[cfg(feature = "vendor_hid")]
+            InterfaceDescriptor {
+                interface_number: 1,
+                interface_class: 0x03, // HID
+                interface_subclass: 0x00,
+                interface_protocol: 0x00,
+                ..InterfaceDescriptor::default()
+            },
         ];
 
-        let endpoints: &[&[EndpointDescriptor]] = &[&[
-            EndpointDescriptor {
-                endpoint_address: EndpointAddress::new_const(
-                    ENDPOINT_NUM,
-                    TransferDirection::HostToDevice,
-                ),
-                transfer_type: TransferType::Interrupt,
-                max_packet_size: 64,
-                interval: 5,
-            },
-            EndpointDescriptor {
-                endpoint_address: EndpointAddress::new_const(
-                    ENDPOINT_NUM,
-                    TransferDirection::DeviceToHost,
-                ),
-                transfer_type: TransferType::Interrupt,
-                max_packet_size: 64,
-                interval: 5,
-            },
-        ]];
+        let endpoints: &[&[EndpointDescriptor]] = &[
+            &[
+                // 2 Endpoints for FIDO
+                EndpointDescriptor {
+                    endpoint_address: EndpointAddress::new_const(
+                        ENDPOINT_NUM,
+                        TransferDirection::HostToDevice,
+                    ),
+                    transfer_type: TransferType::Interrupt,
+                    max_packet_size: 64,
+                    interval: 5,
+                },
+                EndpointDescriptor {
+                    endpoint_address: EndpointAddress::new_const(
+                        ENDPOINT_NUM,
+                        TransferDirection::DeviceToHost,
+                    ),
+                    transfer_type: TransferType::Interrupt,
+                    max_packet_size: 64,
+                    interval: 5,
+                },
+            ],
+            // 2 Endpoints for FIDO
+            #[cfg(feature = "vendor_hid")]
+            &[
+                EndpointDescriptor {
+                    endpoint_address: EndpointAddress::new_const(
+                        ENDPOINT_NUM + 1,
+                        TransferDirection::HostToDevice,
+                    ),
+                    transfer_type: TransferType::Interrupt,
+                    max_packet_size: 64,
+                    interval: 5,
+                },
+                EndpointDescriptor {
+                    endpoint_address: EndpointAddress::new_const(
+                        ENDPOINT_NUM + 1,
+                        TransferDirection::DeviceToHost,
+                    ),
+                    transfer_type: TransferType::Interrupt,
+                    max_packet_size: 64,
+                    interval: 5,
+                },
+            ],
+        ];
 
         let (device_descriptor_buffer, other_descriptor_buffer) =
             descriptors::create_descriptor_buffers(
@@ -130,7 +206,11 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> ClientCtapHID<'a, 'b, C> {
                 },
                 interfaces,
                 endpoints,
-                Some(&HID),
+                Some(&[
+                    &HID,
+                    #[cfg(feature = "vendor_hid")]
+                    &VENDOR_HID,
+                ]),
                 None, // No CDC descriptor array
             );
 
@@ -139,8 +219,16 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> ClientCtapHID<'a, 'b, C> {
                 controller,
                 device_descriptor_buffer,
                 other_descriptor_buffer,
-                Some(&HID),
-                Some(&CTAP_REPORT),
+                Some([
+                    &HID,
+                    #[cfg(feature = "vendor_hid")]
+                    &VENDOR_HID,
+                ]),
+                Some([
+                    &CTAP_REPORT,
+                    #[cfg(feature = "vendor_hid")]
+                    &VENDOR_REPORT,
+                ]),
                 LANGUAGES,
                 strings,
             ),

@@ -8,3 +8,6 @@ edition.workspace = true
 kernel = { path = "../kernel" }
 enum_primitive = { path = "../libraries/enum_primitive" }
 tickv = { path = "../libraries/tickv" }
+
+[features]
+vendor_hid = []

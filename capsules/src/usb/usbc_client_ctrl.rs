@@ -40,6 +40,12 @@ const DESCRIPTOR_BUFLEN: usize = 128;
 
 const N_ENDPOINTS: usize = 3;
 
+#[cfg(feature = "vendor_hid")]
+const N_HID_INTERFACES: usize = 2;
+
+#[cfg(not(feature = "vendor_hid"))]
+const N_HID_INTERFACES: usize = 1;
+
 /// Handler for USB control endpoint requests.
 pub struct ClientCtrl<'a, 'b, U: 'a> {
     /// The USB hardware controller.
@@ -66,12 +72,12 @@ pub struct ClientCtrl<'a, 'b, U: 'a> {
 
     /// An optional HID descriptor for the configuration. This can be requested
     /// separately. It must also be included in `other_descriptor_buffer` if it exists.
-    hid_descriptor: Option<&'b HIDDescriptor<'b>>,
+    hid_descriptor: Option<[&'b HIDDescriptor<'b>; N_HID_INTERFACES]>,
 
     /// An optional report descriptor for the configuration. This can be
     /// requested separately. It must also be included in
     /// `other_descriptor_buffer` if it exists.
-    report_descriptor: Option<&'b ReportDescriptor<'b>>,
+    report_descriptor: Option<[&'b ReportDescriptor<'b>; N_HID_INTERFACES]>,
 
     /// Supported language (only one for now).
     language: &'b [u16; 1],
@@ -106,8 +112,8 @@ impl<'a, 'b, U: hil::usb::UsbController<'a>> ClientCtrl<'a, 'b, U> {
         controller: &'a U,
         device_descriptor_buffer: DeviceBuffer,
         other_descriptor_buffer: DescriptorBuffer,
-        hid_descriptor: Option<&'b HIDDescriptor<'b>>,
-        report_descriptor: Option<&'b ReportDescriptor<'b>>,
+        hid_descriptor: Option<[&'b HIDDescriptor<'b>; N_HID_INTERFACES]>,
+        report_descriptor: Option<[&'b ReportDescriptor<'b>; N_HID_INTERFACES]>,
         language: &'b [u16; 1],
         strings: &'b [&'b str],
     ) -> Self {
@@ -333,28 +339,39 @@ impl<'a, 'b, U: hil::usb::UsbController<'a>> ClientCtrl<'a, 'b, U> {
                 descriptor_type,
                 // TODO: use the descriptor index
                 descriptor_index: _,
-                // TODO: use the language ID?
-                lang_id: _,
+                lang_id,
                 requested_length,
             } => match descriptor_type {
                 DescriptorType::HID => {
-                    if let Some(desc) = self.hid_descriptor {
-                        let buf = self.descriptor_buf();
-                        let len = desc.write_to(buf);
-                        let end = min(len, requested_length as usize);
-                        self.state[endpoint].set(State::CtrlIn(0, end));
-                        hil::usb::CtrlSetupResult::Ok
+                    if let Some(dh) = self.hid_descriptor {
+                        let interface = lang_id as usize;
+                        if interface < dh.len() {
+                            let d = dh[interface];
+                            let buf = self.descriptor_buf();
+                            let len = d.write_to(buf);
+                            let end = min(len, requested_length as usize);
+                            self.state[endpoint].set(State::CtrlIn(0, end));
+                            hil::usb::CtrlSetupResult::Ok
+                        } else {
+                            hil::usb::CtrlSetupResult::ErrGeneric
+                        }
                     } else {
                         hil::usb::CtrlSetupResult::ErrGeneric
                     }
                 }
                 DescriptorType::Report => {
-                    if let Some(desc) = self.report_descriptor {
-                        let buf = self.descriptor_buf();
-                        let len = desc.write_to(buf);
-                        let end = min(len, requested_length as usize);
-                        self.state[endpoint].set(State::CtrlIn(0, end));
-                        hil::usb::CtrlSetupResult::Ok
+                    if let Some(desc_array) = self.report_descriptor {
+                        let interface = lang_id as usize;
+                        if interface < desc_array.len() {
+                            let desc = desc_array[interface];
+                            let buf = self.descriptor_buf();
+                            let len = desc.write_to(buf);
+                            let end = min(len, requested_length as usize);
+                            self.state[endpoint].set(State::CtrlIn(0, end));
+                            hil::usb::CtrlSetupResult::Ok
+                        } else {
+                            hil::usb::CtrlSetupResult::ErrGeneric
+                        }
                     } else {
                         hil::usb::CtrlSetupResult::ErrGeneric
                     }
