@@ -1,5 +1,4 @@
 pub mod cdc;
-pub mod ctap;
 pub mod descriptors;
 pub mod usb_ctap;
 pub mod usb_user;
