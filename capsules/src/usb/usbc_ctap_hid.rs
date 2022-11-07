@@ -18,13 +18,27 @@ use core::cell::Cell;
 use kernel::debug;
 use kernel::hil;
 use kernel::hil::usb::TransferType;
+use kernel::syscall::CommandReturn;
 use kernel::utilities::cells::OptionalCell;
 
 static LANGUAGES: &'static [u16; 1] = &[
     0x0409, // English (United States)
 ];
 
+#[cfg(not(feature = "vendor_hid"))]
+const NUM_ENDPOINTS: usize = 1;
+#[cfg(feature = "vendor_hid")]
+const NUM_ENDPOINTS: usize = 2;
+
 const ENDPOINT_NUM: usize = 1;
+#[cfg(feature = "vendor_hid")]
+const VENDOR_ENDPOINT_NUM: usize = ENDPOINT_NUM + 1;
+
+static ENDPOINTS: &'static [usize] = &[
+    ENDPOINT_NUM,
+    #[cfg(feature = "vendor_hid")]
+    VENDOR_ENDPOINT_NUM,
+];
 
 static CTAP_REPORT_DESCRIPTOR: &'static [u8] = &[
     0x06, 0xD0, 0xF1, // HID_UsagePage ( FIDO_USAGE_PAGE ),
@@ -99,19 +113,39 @@ static VENDOR_HID: HIDDescriptor<'static> = HIDDescriptor {
     sub_descriptors: VENDOR_HID_SUB_DESCRIPTORS,
 };
 
-pub struct ClientCtapHID<'a, 'b, C: 'a> {
-    client_ctrl: ClientCtrl<'a, 'static, C>,
-
-    // 64-byte buffers for the endpoint
+/// The state of each endpoint
+struct EndpointState {
+    endpoint: usize,
     in_buffer: Buffer64,
     out_buffer: Buffer64,
-
-    // Interaction with the client
-    client: OptionalCell<&'b dyn CtapUsbClient>,
     tx_packet: OptionalCell<[u8; 64]>,
     pending_in: Cell<bool>,
     pending_out: Cell<bool>,
+    /// Is there a delayed packet?
     delayed_out: Cell<bool>,
+}
+
+impl EndpointState {
+    pub fn new(endpoint: usize) -> Self {
+        EndpointState {
+            endpoint: endpoint,
+            in_buffer: Buffer64::default(),
+            out_buffer: Buffer64::default(),
+            tx_packet: OptionalCell::empty(),
+            pending_in: Cell::new(false),
+            pending_out: Cell::new(false),
+            delayed_out: Cell::new(false),
+        }
+    }
+}
+
+pub struct ClientCtapHID<'a, 'b, C: 'a> {
+    client_ctrl: ClientCtrl<'a, 'static, C>,
+
+    endpoints: [EndpointState; NUM_ENDPOINTS],
+
+    /// Interaction with the client
+    client: OptionalCell<&'b dyn CtapUsbClient>,
 }
 
 impl<'a, 'b, C: hil::usb::UsbController<'a>> ClientCtapHID<'a, 'b, C> {
@@ -171,7 +205,7 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> ClientCtapHID<'a, 'b, C> {
             &[
                 EndpointDescriptor {
                     endpoint_address: EndpointAddress::new_const(
-                        ENDPOINT_NUM + 1,
+                        VENDOR_ENDPOINT_NUM,
                         TransferDirection::HostToDevice,
                     ),
                     transfer_type: TransferType::Interrupt,
@@ -180,7 +214,7 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> ClientCtapHID<'a, 'b, C> {
                 },
                 EndpointDescriptor {
                     endpoint_address: EndpointAddress::new_const(
-                        ENDPOINT_NUM + 1,
+                        VENDOR_ENDPOINT_NUM,
                         TransferDirection::DeviceToHost,
                     ),
                     transfer_type: TransferType::Interrupt,
@@ -233,99 +267,136 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> ClientCtapHID<'a, 'b, C> {
                 LANGUAGES,
                 strings,
             ),
-            in_buffer: Buffer64::default(),
-            out_buffer: Buffer64::default(),
+            endpoints: [
+                EndpointState::new(ENDPOINT_NUM),
+                #[cfg(feature = "vendor_hid")]
+                EndpointState::new(VENDOR_ENDPOINT_NUM),
+            ],
             client: OptionalCell::empty(),
-            tx_packet: OptionalCell::empty(),
-            pending_in: Cell::new(false),
-            pending_out: Cell::new(false),
-            delayed_out: Cell::new(false),
         }
+    }
+
+    fn get_endpoint(&'a self, endpoint: usize) -> Option<&'a EndpointState> {
+        for (i, ep) in ENDPOINTS.iter().enumerate() {
+            if endpoint == *ep {
+                return Some(&self.endpoints[i]);
+            }
+        }
+        None
     }
 
     pub fn set_client(&'a self, client: &'b dyn CtapUsbClient) {
         self.client.set(client);
     }
 
-    pub fn transmit_packet(&'a self, packet: &[u8]) -> bool {
-        if self.pending_in.get() {
-            // The previous packet has not yet been transmitted, reject the new one.
-            false
-        } else {
-            self.pending_in.set(true);
+    pub fn transmit_packet(&'a self, packet: &[u8], endpoint: usize) -> CommandReturn {
+        if let Some(s) = self.get_endpoint(endpoint) {
+            if s.pending_in.get() {
+                // The previous packet has not yet been transmitted, reject the new one.
+                return CommandReturn::failure(kernel::ErrorCode::BUSY);
+            }
+            s.pending_in.set(true);
             let mut buf: [u8; 64] = [0; 64];
             buf.copy_from_slice(packet);
-            self.tx_packet.set(buf);
+            s.tx_packet.set(buf);
             // Alert the controller that we now have data to send on the Interrupt IN endpoint.
-            self.controller().endpoint_resume_in(1);
-            true
+            self.controller().endpoint_resume_in(endpoint);
+            CommandReturn::success()
+        } else {
+            // unsupported endpoint
+            CommandReturn::failure(kernel::ErrorCode::INVAL)
         }
     }
 
-    pub fn receive_packet(&'a self, app: &mut App) -> bool {
-        if self.pending_out.get() {
-            // The previous packet has not yet been received, reject the new one.
-            false
-        } else {
-            self.pending_out.set(true);
-            // In case we reported Delay before, send the pending packet back to the client.
-            // Otherwise, there's nothing to do, the controller will send us a packet_out when a
-            // packet arrives.
-            if self.delayed_out.take() {
-                if self.send_packet_to_client(Some(app)) {
-                    // If that succeeds, alert the controller that we can now
-                    // receive data on the Interrupt OUT endpoint.
-                    self.controller().endpoint_resume_out(1);
+    pub fn receive_packet(&'a self, app: &mut App) {
+        for (_, s) in self.endpoints.iter().enumerate() {
+            if s.pending_out.get() {
+                // The previous packet has not yet been received, reject the new one.
+                continue;
+            } else {
+                s.pending_out.set(true);
+                // In case we reported Delay before, send the pending packet back to the client.
+                // Otherwise, there's nothing to do, the controller will send us a packet_out when a
+                // packet arrives.
+                if s.delayed_out.take() {
+                    if self.send_packet_to_client(s.endpoint, Some(app)) {
+                        // If that succeeds, alert the controller that we can now
+                        // receive data on the Interrupt OUT endpoint.
+                        self.controller().endpoint_resume_out(s.endpoint);
+                    }
                 }
             }
-            true
         }
     }
 
     // Send an OUT packet available in the controller back to the client.
     // This returns false if the client is not ready to receive a packet, and true if the client
     // successfully accepted the packet.
-    fn send_packet_to_client(&'a self, app: Option<&mut App>) -> bool {
-        // Copy the packet into a buffer to send to the client.
-        let mut buf: [u8; 64] = [0; 64];
-        for (i, x) in self.out_buffer.buf.iter().enumerate() {
-            buf[i] = x.get();
-        }
+    fn send_packet_to_client(&'a self, endpoint: usize, app: Option<&mut App>) -> bool {
+        if let Some(s) = self.get_endpoint(endpoint) {
+            // Copy the packet into a buffer to send to the client.
+            let mut buf: [u8; 64] = [0; 64];
+            for (i, x) in s.out_buffer.buf.iter().enumerate() {
+                buf[i] = x.get();
+            }
 
-        assert!(!self.delayed_out.get());
+            assert!(!s.delayed_out.get());
 
-        // Notify the client
-        if self
-            .client
-            .map_or(false, |client| client.can_receive_packet(&app))
-        {
-            assert!(self.pending_out.take());
+            // Notify the client
+            if self
+                .client
+                .map_or(false, |client| client.can_receive_packet(&app))
+            {
+                assert!(s.pending_out.take());
 
-            // Clear any pending packet on the transmitting side.
-            // It's up to the client to handle the received packet and decide if this packet
-            // should be re-transmitted or not.
-            self.cancel_in_transaction();
+                // Clear any pending packet on the transmitting side.
+                // It's up to the client to handle the received packet and decide if this packet
+                // should be re-transmitted or not.
+                self.cancel_in_transaction(endpoint);
 
-            self.client.map(|client| client.packet_received(&buf, app));
-            true
+                self.client
+                    .map(|client| client.packet_received(&buf, endpoint, app));
+                true
+            } else {
+                // Cannot receive now, indicate a delay to the controller.
+                s.delayed_out.set(true);
+                false
+            }
         } else {
-            // Cannot receive now, indicate a delay to the controller.
-            self.delayed_out.set(true);
+            // unsupported endpoint
             false
         }
     }
 
-    pub fn cancel_transaction(&'a self) -> bool {
-        self.cancel_in_transaction() | self.cancel_out_transaction()
+    /// Cancel transaction(s) in process. |endpoint| of 0 indicates all endpoints.
+    pub fn cancel_transaction(&'a self, endpoint: usize) -> bool {
+        if endpoint > 0 {
+            return self.cancel_in_transaction(endpoint) | self.cancel_out_transaction(endpoint);
+        }
+        let mut r = false;
+        for (_, s) in self.endpoints.iter().enumerate() {
+            r |= self.cancel_in_transaction(s.endpoint) | self.cancel_out_transaction(s.endpoint);
+        }
+        r
     }
 
-    fn cancel_in_transaction(&'a self) -> bool {
-        self.tx_packet.take();
-        self.pending_in.take()
+    fn cancel_in_transaction(&'a self, endpoint: usize) -> bool {
+        if let Some(s) = self.get_endpoint(endpoint) {
+            s.tx_packet.take();
+            s.pending_in.take()
+        } else {
+            // Unsupported endpoint
+            false
+        }
     }
 
-    fn cancel_out_transaction(&'a self) -> bool {
-        self.pending_out.take()
+    fn cancel_out_transaction(&'a self, endpoint: usize) -> bool {
+        if let Some(s) = self.get_endpoint(endpoint) {
+            s.pending_out.take()
+        } else {
+            // Unsupported endpoint
+            false
+        }
     }
 
     #[inline]
@@ -339,13 +410,15 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> hil::usb::Client<'a> for ClientCtap
         // Set up the default control endpoint
         self.client_ctrl.enable();
 
-        // Set up the interrupt in-out endpoint
-        self.controller()
-            .endpoint_set_in_buffer(1, &self.in_buffer.buf);
-        self.controller()
-            .endpoint_set_out_buffer(1, &self.out_buffer.buf);
-        self.controller()
-            .endpoint_in_out_enable(TransferType::Interrupt, 1);
+        // Set up the interrupt in-out endpoint(s).
+        for (i, endpoint) in ENDPOINTS.iter().enumerate() {
+            self.controller()
+                .endpoint_set_in_buffer(*endpoint, &self.endpoints[i].in_buffer.buf);
+            self.controller()
+                .endpoint_set_out_buffer(*endpoint, &self.endpoints[i].out_buffer.buf);
+            self.controller()
+                .endpoint_in_out_enable(TransferType::Interrupt, *endpoint);
+        }
     }
 
     fn attach(&'a self) {
@@ -388,20 +461,20 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> hil::usb::Client<'a> for ClientCtap
         match transfer_type {
             TransferType::Bulk => hil::usb::InResult::Error,
             TransferType::Interrupt => {
-                if endpoint != 1 {
-                    return hil::usb::InResult::Error;
-                }
-
-                if let Some(packet) = self.tx_packet.take() {
-                    let buf = &self.in_buffer.buf;
-                    for i in 0..64 {
-                        buf[i].set(packet[i]);
+                if let Some(s) = self.get_endpoint(endpoint) {
+                    if let Some(packet) = s.tx_packet.take() {
+                        let buf = &s.in_buffer.buf;
+                        for i in 0..64 {
+                            buf[i].set(packet[i]);
+                        }
+                        hil::usb::InResult::Packet(64)
+                    } else {
+                        // Nothing to send
+                        hil::usb::InResult::Delay
                     }
-
-                    hil::usb::InResult::Packet(64)
                 } else {
-                    // Nothing to send
-                    hil::usb::InResult::Delay
+                    // Unsupported endpoint
+                    return hil::usb::InResult::Error;
                 }
             }
             TransferType::Control | TransferType::Isochronous => unreachable!(),
@@ -418,7 +491,7 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> hil::usb::Client<'a> for ClientCtap
         match transfer_type {
             TransferType::Bulk => hil::usb::OutResult::Error,
             TransferType::Interrupt => {
-                if endpoint != 1 {
+                if endpoint == 0 || endpoint > NUM_ENDPOINTS {
                     return hil::usb::OutResult::Error;
                 }
 
@@ -426,7 +499,7 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> hil::usb::Client<'a> for ClientCtap
                     // Cannot process this packet
                     hil::usb::OutResult::Error
                 } else {
-                    if self.send_packet_to_client(None) {
+                    if self.send_packet_to_client(endpoint, None) {
                         hil::usb::OutResult::Ok
                     } else {
                         hil::usb::OutResult::Delay
@@ -438,21 +511,21 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> hil::usb::Client<'a> for ClientCtap
     }
 
     fn packet_transmitted(&'a self, endpoint: usize) {
-        if endpoint != 1 {
+        if let Some(s) = self.get_endpoint(endpoint) {
+            if s.tx_packet.is_some() {
+                panic!("Unexpected tx_packet while a packet was being transmitted.");
+            }
+            s.pending_in.set(false);
+
+            // Clear any pending packet on the receiving side.
+            // It's up to the client to handle the transmitted packet and decide if they want to
+            // receive another packet.
+            self.cancel_out_transaction(endpoint);
+
+            // Notify the client
+            self.client.map(|client| client.packet_transmitted());
+        } else {
             panic!("Unexpected transmission on ep {}", endpoint);
         }
-
-        if self.tx_packet.is_some() {
-            panic!("Unexpected tx_packet while a packet was being transmitted.");
-        }
-        self.pending_in.set(false);
-
-        // Clear any pending packet on the receiving side.
-        // It's up to the client to handle the transmitted packet and decide if they want to
-        // receive another packet.
-        self.cancel_out_transaction();
-
-        // Notify the client
-        self.client.map(|client| client.packet_transmitted());
     }
 }

@@ -43,8 +43,7 @@ pub trait CtapUsbClient {
     fn can_receive_packet(&self, app: &Option<&mut App>) -> bool;
 
     // Signal to the client that a packet has been received.
-    // If App is not supplied, it will be found from the implementation's members.
-    fn packet_received(&self, packet: &[u8; 64], app: Option<&mut App>);
+    fn packet_received(&self, packet: &[u8; 64], endpoint: usize, app: Option<&mut App>);
 
     // Signal to the client that a packet has been transmitted.
     fn packet_transmitted(&self);
@@ -60,7 +59,13 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> CtapUsbSyscallDriver<'a, 'b, C> {
         CtapUsbSyscallDriver { usb_client, apps }
     }
 
-    fn app_packet_received(&self, packet: &[u8; 64], app: &mut App, kernel_data: &GrantKernelData) {
+    fn app_packet_received(
+        &self,
+        packet: &[u8; 64],
+        endpoint: usize,
+        app: &mut App,
+        kernel_data: &GrantKernelData,
+    ) {
         if app.connected && app.waiting && app.side.map_or(false, |side| side.can_receive()) {
             kernel_data
                 .get_readwrite_processbuffer(1)
@@ -71,7 +76,7 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> CtapUsbSyscallDriver<'a, 'b, C> {
                     app.waiting = false;
                     // Signal to the app that a packet is ready.
                     kernel_data
-                        .schedule_upcall(CTAP_CALLBACK_RECEIVED_SUBSCRIBE_NUM, (0, 0, 0))
+                        .schedule_upcall(CTAP_CALLBACK_RECEIVED_SUBSCRIBE_NUM, (endpoint, 0, 0))
                         .unwrap();
                     // reset the client state
                     app.check_side();
@@ -102,10 +107,10 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> CtapUsbClient for CtapUsbSyscallDri
     }
 
     // TODO: interface weird. we need the reentry to get the kernel data
-    fn packet_received(&self, packet: &[u8; 64], _app: Option<&mut App>) {
+    fn packet_received(&self, packet: &[u8; 64], endpoint: usize, _app: Option<&mut App>) {
         for app in self.apps.iter() {
             app.enter(|a, kernel_data| {
-                self.app_packet_received(packet, a, kernel_data);
+                self.app_packet_received(packet, endpoint, a, kernel_data);
             })
         }
     }
@@ -139,7 +144,7 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> SyscallDriver for CtapUsbSyscallDri
     fn command(
         &self,
         cmd_num: usize,
-        _arg1: usize,
+        endpoint: usize,
         _arg2: usize,
         process_id: ProcessId,
     ) -> CommandReturn {
@@ -190,12 +195,14 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> SyscallDriver for CtapUsbSyscallDri
                                         buffer.enter(|buf| {
                                             let mut packet: [u8; 64] = [0; 64];
                                             buf.copy_to_slice(&mut packet);
-                                            if self.usb_client.transmit_packet(&packet) {
+                                            let r =
+                                                self.usb_client.transmit_packet(&packet, endpoint);
+
+                                            if r.is_success() {
                                                 app.waiting = true;
-                                                CommandReturn::success()
-                                            } else {
-                                                CommandReturn::failure(ErrorCode::BUSY)
                                             }
+
+                                            r
                                         })
                                     })
                                     .unwrap_or(CommandReturn::failure(ErrorCode::FAIL))
@@ -261,11 +268,7 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> SyscallDriver for CtapUsbSyscallDri
                                                 buf.copy_to_slice(&mut packet);
 
                                                 // Indicates to the driver that we have a packet to send.
-                                                if self.usb_client.transmit_packet(&packet) {
-                                                    CommandReturn::success()
-                                                } else {
-                                                    CommandReturn::failure(ErrorCode::BUSY)
-                                                }
+                                                self.usb_client.transmit_packet(&packet, endpoint)
                                             })
                                         })
                                         .unwrap_or(CommandReturn::failure(ErrorCode::FAIL))
@@ -287,7 +290,7 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> SyscallDriver for CtapUsbSyscallDri
                             // FIXME: if cancellation failed, the app should still wait. But that
                             // doesn't work yet.
                             app.waiting = false;
-                            if self.usb_client.cancel_transaction() {
+                            if self.usb_client.cancel_transaction(endpoint) {
                                 CommandReturn::success()
                             } else {
                                 // Cannot cancel now because the transaction is already in process.
