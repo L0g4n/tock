@@ -252,27 +252,28 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> SyscallDriver for CtapUsbSyscallDri
                             if app.waiting {
                                 CommandReturn::failure(ErrorCode::ALREADY)
                             } else {
+                                // send a packet before receiving one
+                                let r = kernel
+                                    .get_readonly_processbuffer(1)
+                                    .and_then(|process_buffer| {
+                                        process_buffer.enter(|buf| {
+                                            let mut packet: [u8; 64] = [0; 64];
+                                            buf.copy_to_slice(&mut packet);
+
+                                            // Indicates to the driver that we have a packet to send.
+                                            self.usb_client.transmit_packet(&packet, endpoint)
+                                        })
+                                    })
+                                    .unwrap_or(CommandReturn::failure(ErrorCode::FAIL));
+                                if !r.is_success() {
+                                    return r;
+                                }
+
                                 // Indicates to the driver that we can receive any pending packet.
                                 app.waiting = true;
                                 self.usb_client.receive_packet(app);
 
-                                if !app.waiting {
-                                    // The call to receive_packet() collected a pending packet.
-                                    CommandReturn::success()
-                                } else {
-                                    kernel
-                                        .get_readonly_processbuffer(1)
-                                        .and_then(|process_buffer| {
-                                            process_buffer.enter(|buf| {
-                                                let mut packet: [u8; 64] = [0; 64];
-                                                buf.copy_to_slice(&mut packet);
-
-                                                // Indicates to the driver that we have a packet to send.
-                                                self.usb_client.transmit_packet(&packet, endpoint)
-                                            })
-                                        })
-                                        .unwrap_or(CommandReturn::failure(ErrorCode::FAIL))
-                                }
+                                CommandReturn::success()
                             }
                         } else {
                             CommandReturn::failure(ErrorCode::INVAL)
