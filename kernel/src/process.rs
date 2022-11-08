@@ -8,7 +8,7 @@ use core::str;
 use crate::capabilities;
 use crate::errorcode::ErrorCode;
 use crate::ipc;
-use crate::kernel::Kernel;
+use crate::kernel::{Kernel, StorageLocation};
 use crate::platform::mpu::{self};
 use crate::processbuffer::{ReadOnlyProcessBuffer, ReadWriteProcessBuffer};
 use crate::storage_permissions;
@@ -418,6 +418,15 @@ pub trait Process {
     /// Get the offset from the beginning of flash and the size of the defined
     /// writeable flash region.
     fn get_writeable_flash_region(&self, region_index: usize) -> (u32, u32);
+
+    /// How many storage locations are defined for this process.
+    fn number_storage_locations(&self) -> usize;
+
+    /// Get the i-th storage location.
+    fn get_storage_location(&self, index: usize) -> Option<&StorageLocation>;
+
+    /// Whether a slice fits in a storage location.
+    fn fits_in_storage_location(&self, ptr: usize, len: usize) -> bool;
 
     /// Debug function to update the kernel on where the stack starts for this
     /// process. Processes are not required to call this through the memop

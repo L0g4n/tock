@@ -5,7 +5,14 @@
 use core::cell::Cell;
 use core::ops::{Index, IndexMut};
 use kernel::deferred_call::DeferredCall;
+use kernel::dynamic_deferred_call::{
+    DeferredCallHandle, DynamicDeferredCall, DynamicDeferredCallClient,
+};
+use kernel::grant::{AllowRoCount, AllowRwCount, Grant, UpcallCount};
 use kernel::hil;
+use kernel::process::ProcessId;
+use kernel::processbuffer::ReadableProcessBuffer;
+use kernel::syscall::CommandReturn;
 use kernel::utilities::cells::OptionalCell;
 use kernel::utilities::cells::TakeCell;
 use kernel::utilities::cells::VolatileCell;
@@ -142,7 +149,13 @@ register_bitfields! [u32,
 static DEFERRED_CALL: DeferredCall<DeferredCallTask> =
     unsafe { DeferredCall::new(DeferredCallTask::Nvmc) };
 
+type WORD = u32;
+const WORD_SIZE: usize = core::mem::size_of::<WORD>();
 const PAGE_SIZE: usize = 4096;
+const MAX_WORD_WRITES: usize = 2;
+const MAX_PAGE_ERASES: usize = 10000;
+const WORD_MASK: usize = WORD_SIZE - 1;
+const PAGE_MASK: usize = PAGE_SIZE - 1;
 
 /// This is a wrapper around a u8 array that is sized to a single page for the
 /// nrf. Users of this module must pass an object of this type to use the
@@ -218,6 +231,10 @@ impl Nvmc {
         }
     }
 
+    pub fn configure_readonly(&self) {
+        self.registers.config.write(Configuration::WEN::Ren);
+    }
+
     /// Configure the NVMC to allow writes to flash.
     pub fn configure_writeable(&self) {
         self.registers.config.write(Configuration::WEN::Wen);
@@ -233,6 +250,7 @@ impl Nvmc {
         self.registers
             .erasepage
             .write(ErasePage::ERASEPAGE.val(0x10001000));
+        self.registers.eraseuicr.write(EraseUicr::ERASEUICR::ERASE);
         while !self.is_ready() {}
     }
 
@@ -320,7 +338,7 @@ impl Nvmc {
         // Put the NVMC in write mode.
         self.registers.config.write(Configuration::WEN::Wen);
 
-        for i in (0..data.len()).step_by(4) {
+        for i in (0..data.len()).step_by(WORD_SIZE) {
             let word: u32 = (data[i + 0] as u32) << 0
                 | (data[i + 1] as u32) << 8
                 | (data[i + 2] as u32) << 16
@@ -386,5 +404,214 @@ impl hil::flash::Flash for Nvmc {
 
     fn erase_page(&self, page_number: usize) -> Result<(), ErrorCode> {
         self.erase_page(page_number)
+    }
+}
+
+type NvmcDriverGrant = Grant<App, UpcallCount<1>, AllowRoCount<1>, AllowRwCount<0>>;
+
+/// Provides access to the writeable flash regions of the application.
+///
+/// The purpose of this driver is to provide low-level access to the embedded flash of nRF52 boards
+/// to allow applications to implement flash-aware (like wear-leveling) data-structures. The driver
+/// only permits applications to operate on their writeable flash regions. The API is blocking since
+/// the CPU is halted during write and erase operations.
+///
+/// Supported boards:
+/// - nRF52840 (tested)
+/// - nRF52833
+/// - nRF52811
+/// - nRF52810
+///
+/// The maximum number of writes for the nRF52832 board is not per word but per block (512 bytes)
+/// and as such doesn't exactly fit this API. However, it could be safely supported by returning
+/// either 1 for the maximum number of word writes (i.e. the flash can only be written once before
+/// being erased) or 8 for the word size (i.e. the write granularity is doubled). In both cases,
+/// only 128 writes per block are permitted while the flash supports 181.
+///
+/// # Syscalls
+///
+/// - SUBSCRIBE(0, done): The callback for COMMAND(2) and COMMAND(3).
+/// - COMMAND(0): Check the driver.
+/// - COMMAND(1, 0): Get the word size (always 4).
+/// - COMMAND(1, 1): Get the page size (always 4096).
+/// - COMMAND(1, 2): Get the maximum number of word writes between page erasures (always 2).
+/// - COMMAND(1, 3): Get the maximum number page erasures in the lifetime of the flash (always
+///     10000).
+/// - COMMAND(2, ptr, len): Write the allow slice to the flash region starting at `ptr`.
+///   - `ptr` must be word-aligned.
+///   - The allow slice length must be word aligned.
+///   - The region starting at `ptr` of the same length as the allow slice must be in a writeable
+///     flash region.
+/// - COMMAND(3, ptr, len): Erase a page.
+///   - `ptr` must be page-aligned.
+///   - The page starting at `ptr` must be in a writeable flash region.
+/// - ALLOW(0): The allow slice for COMMAND(2).
+pub struct SyscallDriver {
+    nvmc: &'static Nvmc,
+    apps: NvmcDriverGrant,
+    waiting: OptionalCell<ProcessId>,
+    deferred_caller: &'static DynamicDeferredCall,
+    deferred_handle: OptionalCell<DeferredCallHandle>,
+}
+
+pub const DRIVER_NUM: usize = 0x50003;
+
+#[derive(Default)]
+pub struct App {}
+
+fn is_write_needed(old: u32, new: u32) -> bool {
+    // No need to write if it would not modify the current value.
+    old & new != old
+}
+
+impl SyscallDriver {
+    pub fn new(
+        nvmc: &'static Nvmc,
+        apps: NvmcDriverGrant,
+        deferred_caller: &'static DynamicDeferredCall,
+    ) -> SyscallDriver {
+        nvmc.configure_readonly();
+        SyscallDriver {
+            nvmc,
+            apps,
+            waiting: OptionalCell::empty(),
+            deferred_caller,
+            deferred_handle: OptionalCell::empty(),
+        }
+    }
+
+    pub fn set_deferred_handle(&self, handle: DeferredCallHandle) {
+        self.deferred_handle.replace(handle);
+    }
+
+    /// Writes a word-aligned slice at a word-aligned address.
+    ///
+    /// Words are written only if necessary, i.e. if writing the new value would change the current
+    /// value. This can be used to simplify recovery operations (e.g. if power is lost during a
+    /// write operation). The application doesn't need to check which prefix has already been
+    /// written and may repeat the complete write that was interrupted.
+    ///
+    /// # Safety
+    ///
+    /// The words in this range must have been written less than `MAX_WORD_WRITES` since their last
+    /// page erasure.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `EINVAL` if any of the following conditions does not hold:
+    /// - `ptr` must be word-aligned.
+    /// - `slice.len()` must be word-aligned.
+    /// - The slice starting at `ptr` of length `slice.len()` must fit in the storage.
+    fn write_slice(&self, ptr: usize, slice: &[u8]) -> CommandReturn {
+        if ptr & WORD_MASK != 0 || slice.len() & WORD_MASK != 0 {
+            return CommandReturn::failure(ErrorCode::INVAL);
+        }
+        self.nvmc.configure_writeable();
+        for (i, chunk) in slice.chunks(WORD_SIZE).enumerate() {
+            // `unwrap` cannot fail because `slice.len()` is word-aligned (see above).
+            let val = WORD::from_ne_bytes(<[u8; WORD_SIZE]>::try_from(chunk).unwrap());
+            let loc = unsafe { &*(ptr as *const VolatileCell<u32>).add(i) };
+            if is_write_needed(loc.get(), val) {
+                loc.set(val);
+            }
+        }
+        while !self.nvmc.is_ready() {}
+        self.nvmc.configure_readonly();
+        self.deferred_handle
+            .map(|handle| self.deferred_caller.set(*handle));
+        CommandReturn::success()
+    }
+
+    /// Erases a page at a page-aligned address.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `EINVAL` if any of the following conditions does not hold:
+    /// - `ptr` must be page-aligned.
+    /// - The slice starting at `ptr` of length `PAGE_SIZE` must fit in the storage.
+    fn erase_page(&self, ptr: usize) -> CommandReturn {
+        if ptr & PAGE_MASK != 0 {
+            return CommandReturn::failure(ErrorCode::INVAL);
+        }
+        self.nvmc.erase_page_helper(ptr / PAGE_SIZE);
+        self.nvmc.configure_readonly();
+        self.deferred_handle
+            .map(|handle| self.deferred_caller.set(*handle));
+        CommandReturn::success()
+    }
+}
+
+impl DynamicDeferredCallClient for SyscallDriver {
+    fn call(&self, _handle: DeferredCallHandle) {
+        self.waiting.take().map(|process_id| {
+            self.apps.enter(process_id, |_, kernel_data| {
+                kernel_data.schedule_upcall(0, (0, 0, 0))
+            })
+        });
+    }
+}
+
+impl kernel::syscall::SyscallDriver for SyscallDriver {
+    fn allocate_grant(&self, process_id: ProcessId) -> Result<(), kernel::process::Error> {
+        self.apps.enter(process_id, |_, _| {})
+    }
+
+    fn command(
+        &self,
+        command_num: usize,
+        r2: usize,
+        r3: usize,
+        process_id: ProcessId,
+    ) -> CommandReturn {
+        match (command_num, r2, r3) {
+            (0, _, _) => CommandReturn::success(),
+
+            (1, 0, _) => CommandReturn::success_u32(WORD_SIZE.try_into().unwrap()),
+            (1, 1, _) => CommandReturn::success_u32(PAGE_SIZE.try_into().unwrap()),
+            (1, 2, _) => CommandReturn::success_u32(MAX_WORD_WRITES.try_into().unwrap()),
+            (1, 3, _) => CommandReturn::success_u32(MAX_PAGE_ERASES.try_into().unwrap()),
+            (1, _, _) => CommandReturn::failure(ErrorCode::INVAL),
+
+            (2, ptr, len) => self
+                .apps
+                .enter(process_id, |_, kernel| {
+                    let process_buffer = match kernel.get_readonly_processbuffer(1) {
+                        Ok(buf) => buf,
+                        Err(e) => return CommandReturn::failure(ErrorCode::from(e)),
+                    };
+
+                    let slice = match process_buffer.enter(|slice| {
+                        let mut buf: [u8; WORD_SIZE] = [0; WORD_SIZE];
+                        slice.copy_to_slice(&mut buf);
+                        buf
+                    }) {
+                        Ok(buf) => buf,
+                        Err(e) => return CommandReturn::failure(ErrorCode::from(e)),
+                    };
+
+                    if len != slice.len() {
+                        return CommandReturn::failure(ErrorCode::INVAL);
+                    }
+                    if self.waiting.is_some() {
+                        return CommandReturn::failure(ErrorCode::BUSY);
+                    }
+                    self.waiting.set(process_id);
+                    self.write_slice(ptr, slice.as_ref())
+                })
+                .unwrap_or_else(|err| err.into()),
+
+            (3, ptr, len) => {
+                if len != PAGE_SIZE {
+                    return CommandReturn::failure(ErrorCode::INVAL);
+                }
+                if self.waiting.is_some() {
+                    return CommandReturn::failure(ErrorCode::BUSY);
+                }
+                self.waiting.set(process_id);
+                self.erase_page(ptr)
+            }
+
+            _ => CommandReturn::failure(ErrorCode::NOSUPPORT),
+        }
     }
 }

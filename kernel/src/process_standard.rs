@@ -15,7 +15,7 @@ use crate::collections::ring_buffer::RingBuffer;
 use crate::config;
 use crate::debug;
 use crate::errorcode::ErrorCode;
-use crate::kernel::Kernel;
+use crate::kernel::{Kernel, StorageLocation};
 use crate::platform::chip::Chip;
 use crate::platform::mpu::{self, MPU};
 use crate::process::{Error, FunctionCall, FunctionCallSource, Process, State, Task};
@@ -517,6 +517,35 @@ impl<C: Chip> Process for ProcessStandard<'_, C> {
 
     fn get_writeable_flash_region(&self, region_index: usize) -> (u32, u32) {
         self.header.get_writeable_flash_region(region_index)
+    }
+
+    fn number_storage_locations(&self) -> usize {
+        self.kernel.storage_locations().len()
+    }
+
+    fn get_storage_location(&self, index: usize) -> Option<&StorageLocation> {
+        self.kernel.storage_locations().get(index)
+    }
+
+    fn fits_in_storage_location(&self, ptr: usize, len: usize) -> bool {
+        self.kernel
+            .storage_locations()
+            .iter()
+            .any(|storage_location| {
+                let storage_ptr = storage_location.address;
+                let storage_len = storage_location.size;
+                // We want to check the 2 following inequalities:
+                // (1) `storage_ptr <= ptr`
+                // (2) `ptr + len <= storage_ptr + storage_len`
+                // However, the second one may overflow written as is. We introduce a third
+                // inequality to solve this issue:
+                // (3) `len <= storage_len`
+                // Using this third inequality, we can rewrite the second one as:
+                // (4) `ptr - storage_ptr <= storage_len - len`
+                // This fourth inequality is equivalent to the second one but doesn't overflow when
+                // the first and third inequalities hold.
+                storage_ptr <= ptr && len <= storage_len && ptr - storage_ptr <= storage_len - len
+            })
     }
 
     fn update_stack_start_pointer(&self, stack_pointer: *const u8) {
@@ -1466,6 +1495,33 @@ impl<C: 'static + Chip> ProcessStandard<'_, C> {
                     );
             }
             return Err((ProcessLoadError::MpuInvalidFlashLength, remaining_memory));
+        }
+
+        // Allocate MPU region for the storage locations. The storage locations are currently
+        // readable by all processes due to lack of stable app id.
+        for storage_location in kernel.storage_locations() {
+            if chip
+                .mpu()
+                .allocate_region(
+                    storage_location.address as *const u8,
+                    storage_location.size,
+                    storage_location.size,
+                    mpu::Permissions::ReadOnly,
+                    &mut mpu_config,
+                )
+                .is_some()
+            {
+                continue;
+            }
+            if config::CONFIG.debug_load_processes {
+                debug!(
+                    "[!] flash=[{:#010X}:{:#010X}] process={:?} - couldn't allocate flash region",
+                    storage_location.address,
+                    storage_location.address + storage_location.size,
+                    process_name
+                );
+            }
+            return Ok((None, remaining_memory));
         }
 
         // Determine how much space we need in the application's memory space
