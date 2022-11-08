@@ -43,10 +43,18 @@ use tock_tbf::types::TbfParseError;
 /// is less than this threshold.
 pub(crate) const MIN_QUANTA_THRESHOLD_US: u32 = 500;
 
+/// Represents the type of a storage slice.
+#[derive(Copy, Clone)]
+pub enum StorageType {
+    Store = 1,
+    Partition = 2,
+}
+
 /// Represents a storage location in flash.
 pub struct StorageLocation {
     pub address: usize,
     pub size: usize,
+    pub storage_type: StorageType,
 }
 
 /// Main object for the kernel. Each board will need to create one.
@@ -1415,6 +1423,17 @@ enum FooterCheckResult {
     BadFooter,          // The footer is invalid, no check started
     NoProcess,          // No process was provided, no check started
     Error,              // An internal error occurred, no check started
+}
+
+impl TryFrom<StorageType> for u32 {
+    type Error = ();
+
+    fn try_from(value: StorageType) -> Result<Self, Self::Error> {
+        match value {
+            StorageType::Store => Ok(StorageType::Store as u32),
+            StorageType::Partition => Ok(StorageType::Partition as u32),
+        }
+    }
 }
 
 impl ProcessCheckerMachine {

@@ -107,6 +107,15 @@ pub(crate) fn memop(process: &dyn Process, op_type: usize, r1: usize) -> Syscall
             SyscallReturn::Success
         }
 
+        // Op Type 15: The type of the storage location indexed by r1.
+        15 => {
+            match process.get_storage_location(r1) {
+                None => SyscallReturn::Failure(ErrorCode::FAIL),
+                //Some(x) => ReturnCode::SuccessWithValue { value: x.storage_type as usize }
+                Some(x) => SyscallReturn::SuccessU32(x.storage_type.try_into().unwrap())
+            }
+        }
+
         _ => SyscallReturn::Failure(ErrorCode::NOSUPPORT),
     }
 }
