@@ -120,7 +120,6 @@ struct EndpointState {
     out_buffer: Buffer64,
     tx_packet: OptionalCell<[u8; 64]>,
     pending_in: Cell<bool>,
-    pending_out: Cell<bool>,
     /// Is there a delayed packet?
     delayed_out: Cell<bool>,
 }
@@ -133,7 +132,6 @@ impl EndpointState {
             out_buffer: Buffer64::default(),
             tx_packet: OptionalCell::empty(),
             pending_in: Cell::new(false),
-            pending_out: Cell::new(false),
             delayed_out: Cell::new(false),
         }
     }
@@ -146,6 +144,10 @@ pub struct ClientCtapHID<'a, 'b, C: 'a> {
 
     /// Interaction with the client
     client: OptionalCell<&'b dyn CtapUsbClient>,
+
+    // Is there a pending OUT transaction happening?
+    pending_out: Cell<bool>,
+    next_endpoint_index: Cell<usize>,
 }
 
 impl<'a, 'b, C: hil::usb::UsbController<'a>> ClientCtapHID<'a, 'b, C> {
@@ -267,6 +269,8 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> ClientCtapHID<'a, 'b, C> {
                 LANGUAGES,
                 strings,
             ),
+            pending_out: Cell::new(false),
+            next_endpoint_index: Cell::new(0),
             endpoints: [
                 EndpointState::new(ENDPOINT_NUM),
                 #[cfg(feature = "vendor_hid")]
@@ -309,12 +313,14 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> ClientCtapHID<'a, 'b, C> {
     }
 
     pub fn receive_packet(&'a self, app: &mut App) {
-        for (_, s) in self.endpoints.iter().enumerate() {
-            if s.pending_out.get() {
-                // The previous packet has not yet been received, reject the new one.
-                continue;
-            } else {
-                s.pending_out.set(true);
+        if self.pending_out.get() {
+            // The previous packet has not yet been received, reject the new one.
+        } else {
+            self.pending_out.set(true);
+            // Process the next endpoint that has a delayed packet.
+            for i in self.next_endpoint_index.get()..self.next_endpoint_index.get() + NUM_ENDPOINTS
+            {
+                let s = &self.endpoints[i % NUM_ENDPOINTS];
                 // In case we reported Delay before, send the pending packet back to the client.
                 // Otherwise, there's nothing to do, the controller will send us a packet_out when a
                 // packet arrives.
@@ -347,7 +353,7 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> ClientCtapHID<'a, 'b, C> {
                 .client
                 .map_or(false, |client| client.can_receive_packet(&app))
             {
-                assert!(s.pending_out.take());
+                assert!(self.pending_out.take());
 
                 // Clear any pending packet on the transmitting side.
                 // It's up to the client to handle the received packet and decide if this packet
@@ -356,6 +362,13 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> ClientCtapHID<'a, 'b, C> {
 
                 self.client
                     .map(|client| client.packet_received(&buf, endpoint, app));
+                // Update next packet to send.
+                for (i, ep) in self.endpoints.iter().enumerate() {
+                    if ep.endpoint == endpoint {
+                        self.next_endpoint_index.set((i + 1) % NUM_ENDPOINTS);
+                        break;
+                    }
+                }
                 true
             } else {
                 // Cannot receive now, indicate a delay to the controller.
@@ -391,8 +404,8 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> ClientCtapHID<'a, 'b, C> {
     }
 
     fn cancel_out_transaction(&'a self, endpoint: usize) -> bool {
-        if let Some(s) = self.get_endpoint(endpoint) {
-            s.pending_out.take()
+        if let Some(_) = self.get_endpoint(endpoint) {
+            self.pending_out.take()
         } else {
             // Unsupported endpoint
             false
