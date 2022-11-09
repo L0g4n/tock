@@ -25,6 +25,8 @@ members = [
     "boards/microbit_v2",
     "boards/nordic/nrf52840dk",
     "boards/nordic/nrf52840_dongle",
+    "boards/nordic/nrf52840_dongle_opensk",
+    "boards/nordic/nrf52840_dongle_dfu",
     "boards/nordic/nrf52dk",
     "boards/sma_q3",
     "boards/nucleo_f429zi",
