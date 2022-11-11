@@ -19,12 +19,10 @@ pub const CTAP_CMD_RECEIVE: usize = 3;
 pub const CTAP_CMD_TRANSMIT_OR_RECEIVE: usize = 4;
 pub const CTAP_CMD_CANCEL: usize = 5;
 
-// todo: figure out what do with them
 pub const CTAP_ALLOW_TRANSMIT: usize = 1;
 pub const CTAP_ALLOW_RECEIVE: usize = 2;
 pub const CTAP_ALLOW_TRANSMIT_OR_RECEIVE: usize = 3;
 
-// todo: figure out what do with them
 // ids for the subscribe syscalls
 pub const CTAP_SUBSCRIBE_TRANSMIT: usize = 1;
 pub const CTAP_SUBSCRIBE_RECEIVE: usize = 2;
