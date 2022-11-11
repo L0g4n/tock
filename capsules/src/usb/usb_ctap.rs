@@ -31,8 +31,9 @@ pub const CTAP_SUBSCRIBE_RECEIVE: usize = 2;
 pub const CTAP_SUBSCRIBE_TRANSMIT_OR_RECEIVE: usize = 3;
 
 // the different kinds of subscribe upcalls triggered inside the application when the corresponding event happens
-pub const CTAP_CALLBACK_TRANSMITED_SUBSCRIBE_NUM: usize = 0;
-pub const CTAP_CALLBACK_RECEIVED_SUBSCRIBE_NUM: usize = 1;
+// they need to match the corresponding subscribe nrs which were used by the process
+pub const CTAP_CALLBACK_TRANSMITED_SUBSCRIBE_NUM: usize = CTAP_SUBSCRIBE_TRANSMIT;
+pub const CTAP_CALLBACK_RECEIVED_SUBSCRIBE_NUM: usize = CTAP_SUBSCRIBE_RECEIVE;
 
 type CtabUsbDriverGrant = Grant<App, UpcallCount<2>, AllowRoCount<1>, AllowRwCount<1>>;
 
