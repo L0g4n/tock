@@ -414,13 +414,14 @@ impl DescriptorBuffer {
 /// example, if the interface descriptor list contains `[ID1, ID2, ID3]`,
 /// and the endpoint descriptors list is `[[ED1, ED2], [ED3, ED4, ED5],
 /// [ED6]]`, then the third interface descriptor (`ID3`) has one
-/// corresponding endpoint descriptor (`ED6`).
+/// corresponding endpoint descriptor (`ED6`). If supplied, each HID descriptor
+/// corresponds to the matching index in the interface descriptor list.
 pub fn create_descriptor_buffers(
     device_descriptor: DeviceDescriptor,
     mut configuration_descriptor: ConfigurationDescriptor,
     interface_descriptor: &mut [InterfaceDescriptor],
     endpoint_descriptors: &[&[EndpointDescriptor]],
-    hid_descriptor: Option<&HIDDescriptor>,
+    hid_descriptor: Option<&[&HIDDescriptor<'static>]>,
     cdc_descriptor: Option<&[CdcInterfaceDescriptor]>,
 ) -> (DeviceBuffer, DescriptorBuffer) {
     // Create device descriptor buffer and fill.
@@ -504,7 +505,7 @@ pub fn create_descriptor_buffers(
                 .iter()
                 .map(|descs| descs.iter().map(|d| d.size()).sum::<usize>())
                 .sum::<usize>()
-            + hid_descriptor.map_or(0, |d| d.size())
+            + hid_descriptor.map_or(0, |ds| ds.iter().map(|d| d.size()).sum::<usize>())
             + cdc_descriptor.map_or(0, |ds| ds.iter().map(|d| d.size()).sum::<usize>());
 
     // Set the number of endpoints for each interface descriptor.
@@ -521,13 +522,11 @@ pub fn create_descriptor_buffers(
         // Add the interface descriptor.
         len += d.write_to(&other_buf.buf[len..]);
 
-        // If there is a HID descriptor, we include
-        // it with the first interface descriptor.
-        if i == 0 {
-            // HID descriptor, if any.
-            if let Some(dh) = hid_descriptor {
-                len += dh.write_to(&other_buf.buf[len..]);
-            }
+        // HID descriptor, if present, for this interface.
+        if let Some(dh) = hid_descriptor {
+              if let Some(d) = dh.get(i) {
+                  len += d.write_to(&other_buf.buf[len..]);
+              }
         }
 
         // If there is a CDC descriptor array, we include

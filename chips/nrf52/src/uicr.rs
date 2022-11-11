@@ -1,38 +1,46 @@
 //! User information configuration registers
-//!
-//! Minimal implementation to support activation of the reset button on
-//! nRF52-DK.
 
 use enum_primitive::cast::FromPrimitive;
-use kernel::common::registers::{register_bitfields, ReadWrite};
+use hil::firmware_protection::ProtectionLevel;
+use kernel::common::registers::{register_bitfields, register_structs, ReadWrite};
 use kernel::common::StaticRef;
+use kernel::hil;
+use kernel::ReturnCode;
 
 use crate::gpio::Pin;
+use crate::nvmc;
 
 const UICR_BASE: StaticRef<UicrRegisters> =
-    unsafe { StaticRef::new(0x10001200 as *const UicrRegisters) };
+    unsafe { StaticRef::new(0x10001000 as *const UicrRegisters) };
 
-#[repr(C)]
-struct UicrRegisters {
-    /// Mapping of the nRESET function (see POWER chapter for details)
-    /// - Address: 0x200 - 0x204
-    pselreset0: ReadWrite<u32, Pselreset::Register>,
-    /// Mapping of the nRESET function (see POWER chapter for details)
-    /// - Address: 0x204 - 0x208
-    pselreset1: ReadWrite<u32, Pselreset::Register>,
-    /// Access Port protection
-    /// - Address: 0x208 - 0x20c
-    approtect: ReadWrite<u32, ApProtect::Register>,
-    /// Setting of pins dedicated to NFC functionality: NFC antenna or GPIO
-    /// - Address: 0x20c - 0x210
-    nfcpins: ReadWrite<u32, NfcPins::Register>,
-    _reserved1: [u32; 60],
-    /// External circuitry to be supplied from VDD pin.
-    /// - Address: 0x300 - 0x304
-    extsupply: ReadWrite<u32, ExtSupply::Register>,
-    /// GPIO reference voltage
-    /// - Address: 0x304 - 0x308
-    regout0: ReadWrite<u32, RegOut::Register>,
+register_structs! {
+    UicrRegisters {
+        (0x000 => _reserved1),
+        /// Reserved for Nordic firmware design
+        (0x014 => nrffw: [ReadWrite<u32>; 13]),
+        (0x048 => _reserved2),
+        /// Reserved for Nordic hardware design
+        (0x050 => nrfhw: [ReadWrite<u32>; 12]),
+        /// Reserved for customer
+        (0x080 => customer: [ReadWrite<u32>; 32]),
+        (0x100 => _reserved3),
+        /// Mapping of the nRESET function (see POWER chapter for details)
+        (0x200 => pselreset0: ReadWrite<u32, Pselreset::Register>),
+        /// Mapping of the nRESET function (see POWER chapter for details)
+        (0x204 => pselreset1: ReadWrite<u32, Pselreset::Register>),
+        /// Access Port protection
+        (0x208 => approtect: ReadWrite<u32, ApProtect::Register>),
+        /// Setting of pins dedicated to NFC functionality: NFC antenna or GPIO
+        /// - Address: 0x20c - 0x210
+        (0x20c => nfcpins: ReadWrite<u32, NfcPins::Register>),
+        (0x210 => debugctrl: ReadWrite<u32, DebugControl::Register>),
+        (0x214 => _reserved4),
+        /// External circuitry to be supplied from VDD pin.
+        (0x300 => extsupply: ReadWrite<u32, ExtSupply::Register>),
+        /// GPIO reference voltage
+        (0x304 => regout0: ReadWrite<u32, RegOut::Register>),
+        (0x308 => @END),
+    }
 }
 
 register_bitfields! [u32,
@@ -56,6 +64,21 @@ register_bitfields! [u32,
             ENABLED = 0x00,
             /// Disable
             DISABLED = 0xff
+        ]
+    ],
+    /// Processor debug control
+    DebugControl [
+        CPUNIDEN OFFSET(0) NUMBITS(8) [
+            /// Enable
+            ENABLED = 0xff,
+            /// Disable
+            DISABLED = 0x00
+        ],
+        CPUFPBEN OFFSET(8) NUMBITS(8) [
+            /// Enable
+            ENABLED = 0xff,
+            /// Disable
+            DISABLED = 0x00
         ]
     ],
     /// Setting of pins dedicated to NFC functionality: NFC antenna or GPIO
@@ -172,6 +195,18 @@ impl Uicr {
         self.registers.nfcpins.matches_all(NfcPins::PROTECT::NFC)
     }
 
+    pub fn get_dfu_params(&self) -> (u32, u32) {
+        (
+            self.registers.nrffw[0].get(), // DFU start address
+            self.registers.nrffw[1].get(), // DFU settings address
+        )
+    }
+
+    pub fn set_dfu_params(&self, dfu_start_addr: u32, dfu_settings_addr: u32) {
+        self.registers.nrffw[0].set(dfu_start_addr);
+        self.registers.nrffw[1].set(dfu_settings_addr);
+    }
+
     pub fn is_ap_protect_enabled(&self) -> bool {
         // Here we compare to DISABLED value because any other value should enable the protection.
         !self
@@ -182,5 +217,51 @@ impl Uicr {
 
     pub fn set_ap_protect(&self) {
         self.registers.approtect.write(ApProtect::PALL::ENABLED);
+    }
+}
+
+impl hil::firmware_protection::FirmwareProtection for Uicr {
+    fn get_protection(&self) -> ProtectionLevel {
+        let ap_protect_state = self.is_ap_protect_enabled();
+        let cpu_debug_state = self
+            .registers
+            .debugctrl
+            .matches_all(DebugControl::CPUNIDEN::ENABLED + DebugControl::CPUFPBEN::ENABLED);
+        match (ap_protect_state, cpu_debug_state) {
+            (false, _) => ProtectionLevel::NoProtection,
+            (true, true) => ProtectionLevel::JtagDisabled,
+            (true, false) => ProtectionLevel::FullyLocked,
+        }
+    }
+
+    fn set_protection(&self, level: ProtectionLevel) -> ReturnCode {
+        let current_level = self.get_protection();
+        if current_level > level || level == ProtectionLevel::Unknown {
+            return ReturnCode::EINVAL;
+        }
+        if current_level == level {
+            return ReturnCode::EALREADY;
+        }
+
+        nvmc::Nvmc::new().configure_writeable();
+        if level >= ProtectionLevel::JtagDisabled {
+            self.set_ap_protect();
+        }
+
+        if level >= ProtectionLevel::FullyLocked {
+            // Prevent CPU debug and flash patching. Leaving these enabled could
+            // allow to circumvent protection.
+            self.registers
+                .debugctrl
+                .write(DebugControl::CPUNIDEN::DISABLED + DebugControl::CPUFPBEN::DISABLED);
+            // TODO(jmichel): prevent returning into bootloader if present
+        }
+        nvmc::Nvmc::new().configure_readonly();
+
+        if self.get_protection() == level {
+            ReturnCode::SUCCESS
+        } else {
+            ReturnCode::FAIL
+        }
     }
 }

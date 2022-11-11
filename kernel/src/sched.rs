@@ -118,6 +118,20 @@ pub enum SchedulingDecision {
     TrySleep,
 }
 
+/// Represents the type of a storage slice.
+#[derive(Copy, Clone)]
+pub enum StorageType {
+    Store = 1,
+    Partition = 2,
+}
+
+/// Represents a storage location in flash.
+pub struct StorageLocation {
+    pub address: usize,
+    pub size: usize,
+    pub storage_type: StorageType,
+}
+
 /// Main object for the kernel. Each board will need to create one.
 pub struct Kernel {
     /// How many "to-do" items exist at any given time. These include
@@ -126,6 +140,9 @@ pub struct Kernel {
 
     /// This holds a pointer to the static array of Process pointers.
     processes: &'static [Option<&'static dyn process::ProcessType>],
+
+    /// List of storage locations.
+    storage_locations: &'static [StorageLocation],
 
     /// A counter which keeps track of how many process identifiers have been
     /// created. This is used to create new unique identifiers for processes.
@@ -170,9 +187,17 @@ pub enum StoppedExecutingReason {
 
 impl Kernel {
     pub fn new(processes: &'static [Option<&'static dyn process::ProcessType>]) -> Kernel {
+        Kernel::new_with_storage(processes, &[])
+    }
+
+    pub fn new_with_storage(
+        processes: &'static [Option<&'static dyn process::ProcessType>],
+        storage_locations: &'static [StorageLocation],
+    ) -> Kernel {
         Kernel {
             work: Cell::new(0),
             processes,
+            storage_locations: storage_locations,
             process_identifier_max: Cell::new(0),
             grant_counter: Cell::new(0),
             grants_finalized: Cell::new(false),
@@ -899,5 +924,9 @@ impl Kernel {
         scheduler_timer.reset();
 
         (return_reason, time_executed_us)
+    }
+
+    pub fn storage_locations(&self) -> &'static [StorageLocation] {
+        self.storage_locations
     }
 }

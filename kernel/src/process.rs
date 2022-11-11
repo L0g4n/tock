@@ -359,6 +359,15 @@ pub trait ProcessType {
     /// writeable flash region.
     fn get_writeable_flash_region(&self, region_index: usize) -> (u32, u32);
 
+    /// How many storage locations are defined for this process.
+    fn number_storage_locations(&self) -> usize;
+
+    /// Get the i-th storage location.
+    fn get_storage_location(&self, index: usize) -> Option<&crate::StorageLocation>;
+
+    /// Whether a slice fits in a storage location.
+    fn fits_in_storage_location(&self, ptr: usize, len: usize) -> bool;
+
     /// Debug function to update the kernel on where the stack starts for this
     /// process. Processes are not required to call this through the memop
     /// system call, but it aids in debugging the process.
@@ -1046,6 +1055,35 @@ impl<C: Chip> ProcessType for Process<'_, C> {
 
     fn get_writeable_flash_region(&self, region_index: usize) -> (u32, u32) {
         self.header.get_writeable_flash_region(region_index)
+    }
+
+    fn number_storage_locations(&self) -> usize {
+        self.kernel.storage_locations().len()
+    }
+
+    fn get_storage_location(&self, index: usize) -> Option<&crate::StorageLocation> {
+        self.kernel.storage_locations().get(index)
+    }
+
+    fn fits_in_storage_location(&self, ptr: usize, len: usize) -> bool {
+        self.kernel
+            .storage_locations()
+            .iter()
+            .any(|storage_location| {
+                let storage_ptr = storage_location.address;
+                let storage_len = storage_location.size;
+                // We want to check the 2 following inequalities:
+                // (1) `storage_ptr <= ptr`
+                // (2) `ptr + len <= storage_ptr + storage_len`
+                // However, the second one may overflow written as is. We introduce a third
+                // inequality to solve this issue:
+                // (3) `len <= storage_len`
+                // Using this third inequality, we can rewrite the second one as:
+                // (4) `ptr - storage_ptr <= storage_len - len`
+                // This fourth inequality is equivalent to the second one but doesn't overflow when
+                // the first and third inequalities hold.
+                storage_ptr <= ptr && len <= storage_len && ptr - storage_ptr <= storage_len - len
+            })
     }
 
     fn update_stack_start_pointer(&self, stack_pointer: *const u8) {
@@ -1749,6 +1787,33 @@ impl<C: 'static + Chip> Process<'_, C> {
                 );
             }
             return Err(ProcessLoadError::MpuInvalidFlashLength);
+        }
+
+        // Allocate MPU region for the storage locations. The storage locations are currently
+        // readable by all processes due to lack of stable app id.
+        for storage_location in kernel.storage_locations() {
+            if chip
+                .mpu()
+                .allocate_region(
+                    storage_location.address as *const u8,
+                    storage_location.size,
+                    storage_location.size,
+                    mpu::Permissions::ReadOnly,
+                    &mut mpu_config,
+                )
+                .is_some()
+            {
+                continue;
+            }
+            if config::CONFIG.debug_load_processes {
+                debug!(
+                    "[!] flash=[{:#010X}:{:#010X}] process={:?} - couldn't allocate flash region",
+                    storage_location.address,
+                    storage_location.address + storage_location.size,
+                    process_name
+                );
+            }
+            return Ok((None, remaining_memory));
         }
 
         // Determine how much space we need in the application's

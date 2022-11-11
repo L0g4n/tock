@@ -65,7 +65,7 @@ impl kernel::syscall::UserspaceKernelBoundary for SysCall {
         //
         // The 1.x Tock kernel allocates at least 3 kB to processes, and we need
         // to ensure that happens as userspace may expect it.
-        3 * 1024
+        16 * 1024
 
         // TOCK 2.0
         //

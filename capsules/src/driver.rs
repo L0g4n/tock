@@ -16,6 +16,7 @@ pub enum NUM {
     Adc                   = 0x00005,
     Dac                   = 0x00006,
     AnalogComparator      = 0x00007,
+    FirmwareProtection    = 0x00008,
 
     // Kernel
     Ipc                   = 0x10000,
@@ -26,6 +27,7 @@ pub enum NUM {
     I2cMaster             = 0x20003,
     UsbUser               = 0x20005,
     I2cMasterSlave        = 0x20006,
+    UsbCtap               = 0x20009,
 
     // Radio
     BleAdvertising        = 0x30000,
