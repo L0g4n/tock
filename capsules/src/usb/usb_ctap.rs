@@ -19,21 +19,34 @@ pub const CTAP_CMD_RECEIVE: usize = 3;
 pub const CTAP_CMD_TRANSMIT_OR_RECEIVE: usize = 4;
 pub const CTAP_CMD_CANCEL: usize = 5;
 
-pub const CTAP_ALLOW_TRANSMIT: usize = 1;
-pub const CTAP_ALLOW_RECEIVE: usize = 2;
-pub const CTAP_ALLOW_TRANSMIT_OR_RECEIVE: usize = 3;
+/// Ids for read-only allow buffers
+mod ro_allow {
+    pub const TRANSMIT: usize = 0;
+    pub const TRANSMIT_OR_RECEIVE: usize = 1;
+    pub const COUNT: u8 = 2;
+}
 
-// ids for the subscribe syscalls
-pub const CTAP_SUBSCRIBE_TRANSMIT: usize = 1;
-pub const CTAP_SUBSCRIBE_RECEIVE: usize = 2;
-pub const CTAP_SUBSCRIBE_TRANSMIT_OR_RECEIVE: usize = 3;
+/// Ids for read-write allow buffers
+mod rw_allow {
+    pub const RECEIVE: usize = 0;
+    pub const COUNT: u8 = 1;
+}
 
-// the different kinds of subscribe upcalls triggered inside the application when the corresponding event happens
-// they need to match the corresponding subscribe nrs which were used by the process
-pub const CTAP_CALLBACK_TRANSMITED_SUBSCRIBE_NUM: usize = CTAP_SUBSCRIBE_TRANSMIT;
-pub const CTAP_CALLBACK_RECEIVED_SUBSCRIBE_NUM: usize = CTAP_SUBSCRIBE_RECEIVE;
+/// Ids for scheduling the upcalls
+///
+/// They **must** match the the subscribe numbers which were used by the process.
+mod upcalls {
+    pub const TRANSMITTED: usize = 0;
+    pub const RECEIVED: usize = 1;
+    pub const COUNT: u8 = 2;
+}
 
-type CtabUsbDriverGrant = Grant<App, UpcallCount<2>, AllowRoCount<1>, AllowRwCount<1>>;
+type CtabUsbDriverGrant = Grant<
+    App,
+    UpcallCount<{ upcalls::COUNT }>,
+    AllowRoCount<{ ro_allow::COUNT }>,
+    AllowRwCount<{ rw_allow::COUNT }>,
+>;
 
 pub trait CtapUsbClient {
     // Whether this client is ready to receive a packet. This must be checked before calling
@@ -67,7 +80,7 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> CtapUsbSyscallDriver<'a, 'b, C> {
     ) {
         if app.connected && app.waiting && app.side.map_or(false, |side| side.can_receive()) {
             kernel_data
-                .get_readwrite_processbuffer(1)
+                .get_readwrite_processbuffer(rw_allow::RECEIVE)
                 .and_then(|process_buffer| {
                     process_buffer
                         .mut_enter(|buf| buf.copy_from_slice(packet))
@@ -75,7 +88,7 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> CtapUsbSyscallDriver<'a, 'b, C> {
                     app.waiting = false;
                     // Signal to the app that a packet is ready.
                     kernel_data
-                        .schedule_upcall(CTAP_CALLBACK_RECEIVED_SUBSCRIBE_NUM, (endpoint, 0, 0))
+                        .schedule_upcall(upcalls::RECEIVED, (endpoint, 0, 0))
                         .unwrap();
                     // reset the client state
                     app.check_side();
@@ -124,7 +137,7 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> CtapUsbClient for CtapUsbSyscallDri
                     app.waiting = false;
                     // Signal to the app that the packet was sent.
                     kernel_data
-                        .schedule_upcall(CTAP_CALLBACK_TRANSMITED_SUBSCRIBE_NUM, (0, 0, 0))
+                        .schedule_upcall(upcalls::TRANSMITTED, (0, 0, 0))
                         .unwrap();
 
                     // reset the client state
@@ -189,7 +202,7 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> SyscallDriver for CtapUsbSyscallDri
                                 CommandReturn::failure(ErrorCode::ALREADY)
                             } else {
                                 kernel
-                                    .get_readonly_processbuffer(1)
+                                    .get_readonly_processbuffer(ro_allow::TRANSMIT)
                                     .and_then(|buffer| {
                                         buffer.enter(|buf| {
                                             let mut packet: [u8; 64] = [0; 64];
@@ -253,7 +266,7 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> SyscallDriver for CtapUsbSyscallDri
                             } else {
                                 // send a packet before receiving one
                                 let r = kernel
-                                    .get_readonly_processbuffer(1)
+                                    .get_readonly_processbuffer(ro_allow::TRANSMIT_OR_RECEIVE)
                                     .and_then(|process_buffer| {
                                         process_buffer.enter(|buf| {
                                             let mut packet: [u8; 64] = [0; 64];
