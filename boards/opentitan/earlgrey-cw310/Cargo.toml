@@ -9,7 +9,7 @@ edition.workspace = true
 components = { path = "../../components" }
 rv32i = { path = "../../../arch/rv32i" }
 capsules = { path = "../../../capsules" }
-kernel = { path = "../../../kernel" }
+kernel = { path = "../../../kernel", features = ["debug_load_processes"] }
 earlgrey = { path = "../../../chips/earlgrey" }
 lowrisc = { path = "../../../chips/lowrisc" }
 tock-tbf = { path = "../../../libraries/tock-tbf" }

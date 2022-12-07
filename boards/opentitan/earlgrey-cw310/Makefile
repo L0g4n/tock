@@ -4,7 +4,7 @@ DEFAULT_BOARD_CONFIGURATION=fpga_cw310
 TARGET=riscv32imc-unknown-none-elf
 PLATFORM=earlgrey-cw310
 FLASHID=--dev-id="0403:6010"
-RISC_PREFIX ?= riscv64-linux-gnu
+RISC_PREFIX ?= $(TOOLCHAIN_PATH)/bin/riscv32-unknown-elf
 QEMU ?= ../../../tools/qemu/build/qemu-system-riscv32
 # Override for the entry point
 # This offset is calculated (from the linker file) as:
