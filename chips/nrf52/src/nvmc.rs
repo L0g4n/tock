@@ -152,8 +152,8 @@ static DEFERRED_CALL: DeferredCall<DeferredCallTask> =
 type WORD = u32;
 const WORD_SIZE: usize = core::mem::size_of::<WORD>();
 const PAGE_SIZE: usize = 4096;
-const MAX_WORD_WRITES: usize = 2;
-const MAX_PAGE_ERASES: usize = 10000;
+const MAX_WORD_WRITES: u32 = 2;
+const MAX_PAGE_ERASES: u32 = 10_000;
 const WORD_MASK: usize = WORD_SIZE - 1;
 const PAGE_MASK: usize = PAGE_SIZE - 1;
 
@@ -170,13 +170,11 @@ const PAGE_MASK: usize = PAGE_SIZE - 1;
 ///
 /// let pagebuffer = unsafe { static_init!(NrfPage, NrfPage::default()) };
 /// ```
-pub struct NrfPage(pub [u8; PAGE_SIZE as usize]);
+pub struct NrfPage(pub [u8; PAGE_SIZE]);
 
 impl Default for NrfPage {
     fn default() -> Self {
-        Self {
-            0: [0; PAGE_SIZE as usize],
-        }
+        Self { 0: [0; PAGE_SIZE] }
     }
 }
 impl NrfPage {
@@ -454,7 +452,7 @@ pub struct SyscallDriver {
     deferred_handle: OptionalCell<DeferredCallHandle>,
 }
 
-pub const DRIVER_NUM: usize = 0x50003;
+pub const DRIVER_NUM: usize = 0x50_003;
 
 #[derive(Default)]
 pub struct App {}
@@ -568,8 +566,8 @@ impl kernel::syscall::SyscallDriver for SyscallDriver {
 
             (1, 0, _) => CommandReturn::success_u32(WORD_SIZE.try_into().unwrap()),
             (1, 1, _) => CommandReturn::success_u32(PAGE_SIZE.try_into().unwrap()),
-            (1, 2, _) => CommandReturn::success_u32(MAX_WORD_WRITES.try_into().unwrap()),
-            (1, 3, _) => CommandReturn::success_u32(MAX_PAGE_ERASES.try_into().unwrap()),
+            (1, 2, _) => CommandReturn::success_u32(MAX_WORD_WRITES),
+            (1, 3, _) => CommandReturn::success_u32(MAX_PAGE_ERASES),
             (1, _, _) => CommandReturn::failure(ErrorCode::INVAL),
 
             (2, ptr, len) => self
