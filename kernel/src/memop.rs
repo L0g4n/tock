@@ -107,12 +107,34 @@ pub(crate) fn memop(process: &dyn Process, op_type: usize, r1: usize) -> Syscall
             SyscallReturn::Success
         }
 
+        // 12 - 15 are required for the custom persistent store driver
+        // currently only implemented in the nvmc module of nrf52 series
+        // driver number: 0x50_003
+
+        // Op Type 12: Number of storage locations
+        12 => SyscallReturn::SuccessU32(process.number_storage_locations() as u32),
+
+        // Op Type 13: The start address of the storage location indexed by r1
+        13 => {
+            match process.get_storage_location(r1) {
+                None => SyscallReturn::Failure(ErrorCode::FAIL),
+                Some(x) => SyscallReturn::SuccessU32(x.address as u32),
+            }
+        }
+
+        // Op Type 14: The size of the storage location indexed by r1.
+        14 => {
+            match process.get_storage_location(r1) {
+                None => SyscallReturn::Failure(ErrorCode::FAIL),
+                Some(x) => SyscallReturn::SuccessU32(x.size as u32),
+            }
+        }
+
         // Op Type 15: The type of the storage location indexed by r1.
         15 => {
             match process.get_storage_location(r1) {
                 None => SyscallReturn::Failure(ErrorCode::FAIL),
-                //Some(x) => ReturnCode::SuccessWithValue { value: x.storage_type as usize }
-                Some(x) => SyscallReturn::SuccessU32(x.storage_type.try_into().unwrap())
+                Some(x) => SyscallReturn::SuccessU32(x.storage_type as u32)
             }
         }
 
