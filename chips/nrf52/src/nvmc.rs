@@ -450,6 +450,7 @@ pub struct SyscallDriver {
     waiting: OptionalCell<ProcessId>,
     deferred_caller: &'static DynamicDeferredCall,
     deferred_handle: OptionalCell<DeferredCallHandle>,
+    buffer: TakeCell<'static, [u8]>,
 }
 
 pub const DRIVER_NUM: usize = 0x50_003;
@@ -467,6 +468,7 @@ impl SyscallDriver {
         nvmc: &'static Nvmc,
         apps: NvmcDriverGrant,
         deferred_caller: &'static DynamicDeferredCall,
+        buffer: &'static mut [u8],
     ) -> SyscallDriver {
         nvmc.configure_readonly();
         SyscallDriver {
@@ -475,6 +477,7 @@ impl SyscallDriver {
             waiting: OptionalCell::empty(),
             deferred_caller,
             deferred_handle: OptionalCell::empty(),
+            buffer: TakeCell::new(buffer),
         }
     }
 
@@ -570,33 +573,46 @@ impl kernel::syscall::SyscallDriver for SyscallDriver {
             (1, 3, _) => CommandReturn::success_u32(MAX_PAGE_ERASES),
             (1, _, _) => CommandReturn::failure(ErrorCode::INVAL),
 
-            (2, ptr, len) => self
+            (2, ptr, _len) => self
                 .apps
                 .enter(process_id, |_, kernel| {
-                    let process_buffer = match kernel.get_readonly_processbuffer(1) {
-                        Ok(buf) => buf,
-                        Err(e) => return CommandReturn::failure(ErrorCode::from(e)),
-                    };
+                    kernel
+                        .get_readonly_processbuffer(0)
+                        .and_then(|processbuffer| {
+                            processbuffer.enter(|app_buf| {
+                                // Copy contents to the internal buffer first
+                                self.buffer.take().map_or(
+                                    CommandReturn::failure(ErrorCode::RESERVE),
+                                    |buffer| {
+                                        // as the drivers buffer can be bigger than the app buffer,
+                                        // we choose the minimum to not copy anymore than we need
+                                        let len = core::cmp::min(buffer.len(), app_buf.len());
 
-                    let slice = match process_buffer.enter(|slice| {
-                        let mut buf: [u8; WORD_SIZE] = [0; WORD_SIZE];
-                        slice.copy_to_slice(&mut buf);
-                        buf
-                    }) {
-                        Ok(buf) => buf,
-                        Err(e) => return CommandReturn::failure(ErrorCode::from(e)),
-                    };
+                                        // safety check when the app buffer is too large
+                                        if app_buf.len() > buffer.len() {
+                                            return CommandReturn::failure(ErrorCode::INVAL);
+                                        }
 
-                    if len != slice.len() {
-                        return CommandReturn::failure(ErrorCode::INVAL);
-                    }
-                    if self.waiting.is_some() {
-                        return CommandReturn::failure(ErrorCode::BUSY);
-                    }
-                    self.waiting.set(process_id);
-                    self.write_slice(ptr, slice.as_ref())
+                                        let d = &app_buf[0..len];
+                                        for (i, v) in buffer.as_mut()[0..len].iter_mut().enumerate()
+                                        {
+                                            *v = d[i].get();
+                                        }
+
+                                        if self.waiting.is_some() {
+                                            return CommandReturn::failure(ErrorCode::BUSY);
+                                        }
+                                        self.waiting.set(process_id);
+                                        let result = self.write_slice(ptr, &buffer[0..len]);
+                                        self.buffer.replace(buffer);
+                                        result
+                                    },
+                                )
+                            })
+                        })
+                        .unwrap_or(CommandReturn::failure(ErrorCode::RESERVE))
                 })
-                .unwrap_or_else(|err| err.into()),
+                .unwrap_or_else(|e| CommandReturn::failure(e.into())),
 
             (3, ptr, len) => {
                 if len != PAGE_SIZE {

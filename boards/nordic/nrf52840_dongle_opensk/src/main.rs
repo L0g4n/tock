@@ -87,6 +87,9 @@ static mut CHIP: Option<&'static nrf52840::chip::NRF52<Nrf52840DefaultPeripheral
 // Static reference to process printer for panic dumps
 static mut PROCESS_PRINTER: Option<&'static kernel::process::ProcessPrinterText> = None;
 
+/// Flash buffer for the custom nvmc driver
+static mut APP_FLASH_BUFFER: [u8; 512] = [0; 512];
+
 /// Dummy buffer that causes the linker to reserve enough space for the stack.
 #[no_mangle]
 #[link_section = ".stack_buffer"]
@@ -420,6 +423,7 @@ pub unsafe fn main() {
             &base_peripherals.nvmc,
             board_kernel.create_grant(nrf52840::nvmc::DRIVER_NUM, &memory_allocation_capability),
             dynamic_deferred_caller,
+            &mut APP_FLASH_BUFFER,
         )
     );
     nvmc.set_deferred_handle(
