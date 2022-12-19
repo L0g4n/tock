@@ -34,7 +34,8 @@ mod rw_allow {
 
 /// Ids for scheduling the upcalls
 ///
-/// They **must** match the the subscribe numbers which were used by the process.
+/// They **must** match the the subscribe numbers which were used by the process to
+/// subscribe to the upcall.
 mod upcalls {
     pub const TRANSMITTED: usize = 0;
     pub const RECEIVED: usize = 1;
@@ -83,14 +84,14 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> CtapUsbSyscallDriver<'a, 'b, C> {
                 .get_readwrite_processbuffer(rw_allow::RECEIVE)
                 .and_then(|recv| recv.mut_enter(|dest| dest.copy_from_slice(packet)));
             app.waiting = false;
+            // reset the client state
+            app.check_side();
             // Signal to the app that a packet is ready.
             // TODO: passing the upcallid again in the registers is not needed anymore with Tock 2.0,
             // but is currently still there for backwards compatibility
             kernel
                 .schedule_upcall(upcalls::RECEIVED, (upcalls::RECEIVED, endpoint, 0))
                 .ok();
-            // reset the client state
-            app.check_side();
         }
     }
 }
@@ -130,13 +131,12 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> CtapUsbClient for CtapUsbSyscallDri
                     && app.side.map_or(false, |side| side.can_transmit())
                 {
                     app.waiting = false;
-                    // Signal to the app that the packet was sent.
-                    kernel_data
-                        .schedule_upcall(upcalls::TRANSMITTED, (0, 0, 0))
-                        .unwrap();
-
                     // reset the client state
                     app.check_side();
+                    // Signal to the app that the packet was sent.
+                    kernel_data
+                        .schedule_upcall(upcalls::TRANSMITTED, (upcalls::TRANSMITTED, 0, 0))
+                        .unwrap();
                 }
             });
         }
