@@ -76,26 +76,21 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> CtapUsbSyscallDriver<'a, 'b, C> {
         packet: &[u8; 64],
         endpoint: usize,
         app: &mut App,
-        kernel_data: &GrantKernelData,
+        kernel: &GrantKernelData,
     ) {
         if app.connected && app.waiting && app.side.map_or(false, |side| side.can_receive()) {
-            kernel_data
+            let _ = kernel
                 .get_readwrite_processbuffer(rw_allow::RECEIVE)
-                .and_then(|process_buffer| {
-                    process_buffer
-                        .mut_enter(|buf| buf.copy_from_slice(packet))
-                        .unwrap();
-                    app.waiting = false;
-                    // Signal to the app that a packet is ready.
-                    kernel_data
-                        .schedule_upcall(upcalls::RECEIVED, (endpoint, 0, 0))
-                        .unwrap();
-                    // reset the client state
-                    app.check_side();
-
-                    Ok(())
-                })
-                .unwrap();
+                .and_then(|recv| recv.mut_enter(|dest| dest.copy_from_slice(packet)));
+            app.waiting = false;
+            // Signal to the app that a packet is ready.
+            // TODO: passing the upcallid again in the registers is not needed anymore with Tock 2.0,
+            // but is currently still there for backwards compatibility
+            kernel
+                .schedule_upcall(upcalls::RECEIVED, (upcalls::RECEIVED, endpoint, 0))
+                .ok();
+            // reset the client state
+            app.check_side();
         }
     }
 }
