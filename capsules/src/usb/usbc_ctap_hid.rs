@@ -164,9 +164,10 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> ClientCtapHID<'a, 'b, C> {
         let interfaces: &mut [InterfaceDescriptor] = &mut [
             // Interface declared in the FIDO2 specification, section 8.1.8.1
             InterfaceDescriptor {
-                interface_class: 0x03, // HID
-                interface_subclass: 0x00,
-                interface_protocol: 0x00,
+                interface_number: 0,
+                interface_class: 0x03,    // HID
+                interface_subclass: 0x00, // no subcall
+                interface_protocol: 0x00, // no protocol
                 ..InterfaceDescriptor::default()
             },
             // Vendor HID interface.
@@ -234,6 +235,7 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> ClientCtapHID<'a, 'b, C> {
                     manufacturer_string: 1,
                     product_string: 2,
                     serial_number_string: 3,
+                    class: 0x03, // HID class for all interfaces
                     max_packet_size_ep0: max_ctrl_packet_size,
                     ..descriptors::DeviceDescriptor::default()
                 },

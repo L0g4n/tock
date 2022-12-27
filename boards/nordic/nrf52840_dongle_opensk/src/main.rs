@@ -431,6 +431,7 @@ pub unsafe fn main() {
             .register(nvmc)
             .expect("no deferred call slot available for nvmc"),
     );
+
     // Configure USB controller
     let usb = components::usb_ctap::UsbCtapComponent::new(
         board_kernel,
@@ -441,7 +442,7 @@ pub unsafe fn main() {
         PRODUCT_ID,
         STRINGS,
     )
-    .finalize(components::usb_ctap_component_buf!(nrf52840::usbd::Usbd));
+    .finalize(components::usb_ctap_component_static!(nrf52840::usbd::Usbd));
 
     // not backported yet
     // let crp = components::firmware_protection::FirmwareProtectionComponent::new(
@@ -468,7 +469,6 @@ pub unsafe fn main() {
         analog_comparator,
         nvmc,
         usb,
-        //crp
         ipc: kernel::ipc::IPC::new(
             board_kernel,
             kernel::ipc::DRIVER_NUM,
@@ -476,6 +476,7 @@ pub unsafe fn main() {
         ),
         scheduler,
         systick: cortexm4::systick::SysTick::new_with_calibration(64000000),
+        //crp
     };
 
     let _ = platform.pconsole.start();

@@ -10,15 +10,19 @@ use kernel::hil;
 
 // Setup static space for the objects.
 #[macro_export]
-macro_rules! usb_ctap_component_buf {
-    ($C:ty) => {{
+macro_rules! usb_ctap_component_static {
+    ($C:ty $(,)?) => {{
         use capsules::usb::usb_ctap::CtapUsbSyscallDriver;
         use capsules::usb::usbc_ctap_hid::ClientCtapHID;
-        use core::mem::MaybeUninit;
-        static mut BUF1: MaybeUninit<ClientCtapHID<'static, 'static, $C>> = MaybeUninit::uninit();
-        static mut BUF2: MaybeUninit<CtapUsbSyscallDriver<'static, 'static, $C>> =
-            MaybeUninit::uninit();
-        (&mut BUF1, &mut BUF2)
+        // use core::mem::MaybeUninit;
+        // static mut BUF1: MaybeUninit<ClientCtapHID<'static, 'static, $C>> = MaybeUninit::uninit();
+        // static mut BUF2: MaybeUninit<CtapUsbSyscallDriver<'static, 'static, $C>> =
+        //     MaybeUninit::uninit();
+        let hid = kernel::static_buf!(ClientCtapHID<'static, 'static, $C>);
+        let driver = kernel::static_buf!(CtapUsbSyscallDriver<'static, 'static, $C>);
+
+
+        (hid, driver)
     };};
 }
 
