@@ -56,7 +56,12 @@ pub trait CtapUsbClient {
     fn can_receive_packet(&self, app: &Option<&mut App>) -> bool;
 
     // Signal to the client that a packet has been received.
-    fn packet_received(&self, packet: &[u8; 64], endpoint: usize, app: Option<&mut App>);
+    fn packet_received(
+        &self,
+        packet: &[u8; 64],
+        endpoint: usize,
+        app_data: (Option<&mut App>, Option<&GrantKernelData>),
+    );
 
     // Signal to the client that a packet has been transmitted.
     fn packet_transmitted(&self);
@@ -114,12 +119,26 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> CtapUsbClient for CtapUsbSyscallDri
         result
     }
 
-    // TODO: interface weird. we need the reentry to get the kernel data
-    fn packet_received(&self, packet: &[u8; 64], endpoint: usize, _app: Option<&mut App>) {
-        for app in self.apps.iter() {
-            app.enter(|a, kernel_data| {
-                self.app_packet_received(packet, endpoint, a, kernel_data);
-            })
+    fn packet_received(
+        &self,
+        packet: &[u8; 64],
+        endpoint: usize,
+        app_data: (Option<&mut App>, Option<&GrantKernelData>),
+    ) {
+        match app_data {
+            (None, _) => {
+                for app in self.apps.iter() {
+                    app.enter(|a, kernel_grant| {
+                        self.app_packet_received(packet, endpoint, a, kernel_grant);
+                    })
+                }
+            }
+            (Some(app), Some(kernel_grant)) => {
+                self.app_packet_received(packet, endpoint, app, kernel_grant)
+            }
+            // this should never happen as having a valid app always results
+            // in also having the grant data
+            _ => panic!("invalid app_data combination!"),
         }
     }
 
@@ -222,7 +241,7 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> SyscallDriver for CtapUsbSyscallDri
                 .unwrap_or_else(|err| err.into()),
             CTAP_CMD_RECEIVE => self
                 .apps
-                .enter(process_id, |app, _| {
+                .enter(process_id, |app, kernel_grant| {
                     if !app.connected {
                         CommandReturn::failure(ErrorCode::RESERVE)
                     } else {
@@ -235,7 +254,7 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> SyscallDriver for CtapUsbSyscallDri
                                 CommandReturn::failure(ErrorCode::ALREADY)
                             } else {
                                 app.waiting = true;
-                                self.usb_client.receive_packet(app);
+                                self.usb_client.receive_packet(app, kernel_grant);
                                 CommandReturn::success()
                             }
                         } else {
@@ -246,7 +265,7 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> SyscallDriver for CtapUsbSyscallDri
                 .unwrap_or_else(|err| err.into()),
             CTAP_CMD_TRANSMIT_OR_RECEIVE => self
                 .apps
-                .enter(process_id, |app, kernel| {
+                .enter(process_id, |app, kernel_grant| {
                     if !app.connected {
                         CommandReturn::failure(ErrorCode::RESERVE)
                     } else {
@@ -260,7 +279,7 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> SyscallDriver for CtapUsbSyscallDri
                                 CommandReturn::failure(ErrorCode::ALREADY)
                             } else {
                                 // send a packet before receiving one
-                                let r = kernel
+                                let r = kernel_grant
                                     .get_readonly_processbuffer(ro_allow::TRANSMIT_OR_RECEIVE)
                                     .and_then(|process_buffer| {
                                         process_buffer.enter(|buf| {
@@ -278,7 +297,7 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> SyscallDriver for CtapUsbSyscallDri
 
                                 // Indicates to the driver that we can receive any pending packet.
                                 app.waiting = true;
-                                self.usb_client.receive_packet(app);
+                                self.usb_client.receive_packet(app, kernel_grant);
 
                                 CommandReturn::success()
                             }

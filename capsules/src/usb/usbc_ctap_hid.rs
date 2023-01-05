@@ -16,6 +16,7 @@ use super::usb_ctap::CtapUsbClient;
 use super::usbc_client_ctrl::ClientCtrl;
 use core::cell::Cell;
 use kernel::debug;
+use kernel::grant::GrantKernelData;
 use kernel::hil;
 use kernel::hil::usb::TransferType;
 use kernel::syscall::CommandReturn;
@@ -314,7 +315,7 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> ClientCtapHID<'a, 'b, C> {
         }
     }
 
-    pub fn receive_packet(&'a self, app: &mut App) {
+    pub fn receive_packet(&'a self, app: &mut App, kernel_grant: &GrantKernelData) {
         if self.pending_out.get() {
             // The previous packet has not yet been received, reject the new one.
         } else {
@@ -327,7 +328,7 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> ClientCtapHID<'a, 'b, C> {
                 // Otherwise, there's nothing to do, the controller will send us a packet_out when a
                 // packet arrives.
                 if s.delayed_out.take() {
-                    if self.send_packet_to_client(s.endpoint, Some(app)) {
+                    if self.send_packet_to_client(s.endpoint, Some(app), Some(kernel_grant)) {
                         // If that succeeds, alert the controller that we can now
                         // receive data on the Interrupt OUT endpoint.
                         self.controller().endpoint_resume_out(s.endpoint);
@@ -340,7 +341,12 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> ClientCtapHID<'a, 'b, C> {
     // Send an OUT packet available in the controller back to the client.
     // This returns false if the client is not ready to receive a packet, and true if the client
     // successfully accepted the packet.
-    fn send_packet_to_client(&'a self, endpoint: usize, app: Option<&mut App>) -> bool {
+    fn send_packet_to_client(
+        &'a self,
+        endpoint: usize,
+        app: Option<&mut App>,
+        kernel_grant: Option<&GrantKernelData>,
+    ) -> bool {
         if let Some(s) = self.get_endpoint(endpoint) {
             // Copy the packet into a buffer to send to the client.
             let mut buf: [u8; 64] = [0; 64];
@@ -363,7 +369,7 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> ClientCtapHID<'a, 'b, C> {
                 self.cancel_in_transaction(endpoint);
 
                 self.client
-                    .map(|client| client.packet_received(&buf, endpoint, app));
+                    .map(|client| client.packet_received(&buf, endpoint, (app, kernel_grant)));
                 // Update next packet to send.
                 for (i, ep) in self.endpoints.iter().enumerate() {
                     if ep.endpoint == endpoint {
@@ -514,7 +520,7 @@ impl<'a, 'b, C: hil::usb::UsbController<'a>> hil::usb::Client<'a> for ClientCtap
                     // Cannot process this packet
                     hil::usb::OutResult::Error
                 } else {
-                    if self.send_packet_to_client(endpoint, None) {
+                    if self.send_packet_to_client(endpoint, None, None) {
                         hil::usb::OutResult::Ok
                     } else {
                         hil::usb::OutResult::Delay

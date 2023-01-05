@@ -108,7 +108,7 @@ pub mod io;
 // Whether to use UART debugging or Segger RTT (USB) debugging.
 // - Set to false to use UART.
 // - Set to true to use Segger RTT over USB.
-const USB_DEBUGGING: bool = true;
+const USB_DEBUGGING: bool = false;
 
 const VENDOR_ID: u16 = 0x1915; // Nordic Semiconductor
 const PRODUCT_ID: u16 = 0x521f; // nRF52840 Dongle (PCA10059)
