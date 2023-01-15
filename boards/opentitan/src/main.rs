@@ -24,7 +24,6 @@ use kernel::hil;
 use kernel::hil::digest::Digest;
 use kernel::hil::entropy::Entropy32;
 use kernel::hil::hasher::Hasher;
-use kernel::hil::i2c::I2CMaster;
 use kernel::hil::kv_system::KVSystem;
 use kernel::hil::led::LedHigh;
 use kernel::hil::rng::Rng;
@@ -90,14 +89,27 @@ static mut PROCESS_PRINTER: Option<&'static kernel::process::ProcessPrinterText>
 // How should the kernel respond when a process faults.
 const FAULT_RESPONSE: kernel::process::PanicFaultPolicy = kernel::process::PanicFaultPolicy {};
 
+const VENDOR_ID: u16 = 0x2B3E; // NewAE Technology Inc.
+const PRODUCT_ID: u16 = 0xC310; // CW310
+static STRINGS: &'static [&'static str] = &[
+    // Manufacturer
+    "NewAE Technology Inc.",
+    // Product
+    "OpenSK",
+    // Serial number
+    "v1.0",
+];
+
 /// Dummy buffer that causes the linker to reserve enough space for the stack.
 #[no_mangle]
 #[link_section = ".stack_buffer"]
-pub static mut STACK_MEMORY: [u8; 0x1000] = [0; 0x1000];
+pub static mut STACK_MEMORY: [u8; 0x2000] = [0; 0x2000];
 
 /// A structure representing this platform that holds references to all
 /// capsules for this platform. We've included an alarm and console.
 struct EarlGrey {
+    // TODO: add button driver
+    // buttons need to connect a physical button tho
     led: &'static capsules::led::LedDriver<
         'static,
         LedHigh<'static, earlgrey::gpio::GpioPin<'static>>,
@@ -131,11 +143,6 @@ struct EarlGrey {
         'static,
         capsules::virtual_uart::UartDevice<'static>,
     >,
-    i2c_master: &'static capsules::i2c_master::I2CMasterDriver<'static, lowrisc::i2c::I2c<'static>>,
-    spi_controller: &'static capsules::spi_controller::Spi<
-        'static,
-        capsules::virtual_spi::VirtualSpiMasterDevice<'static, lowrisc::spi_host::SpiHost>,
-    >,
     rng: &'static capsules::rng::RngDriver<'static>,
     aes: &'static capsules::symmetric_encryption::aes::AesDriver<
         'static,
@@ -149,6 +156,11 @@ struct EarlGrey {
             capsules::sip_hash::SipHasher24<'static>,
         >,
         [u8; 8],
+    >,
+    usb: &'static capsules::usb::usb_ctap::CtapUsbSyscallDriver<
+        'static,
+        'static,
+        earlgrey::usbdev::Usb<'static>,
     >,
     syscall_filter: &'static TbfHeaderFilterDefaultAllow,
     scheduler: &'static PrioritySched,
@@ -171,9 +183,8 @@ impl SyscallDriverLookup for EarlGrey {
             capsules::console::DRIVER_NUM => f(Some(self.console)),
             capsules::alarm::DRIVER_NUM => f(Some(self.alarm)),
             capsules::low_level_debug::DRIVER_NUM => f(Some(self.lldb)),
-            capsules::i2c_master::DRIVER_NUM => f(Some(self.i2c_master)),
-            capsules::spi_controller::DRIVER_NUM => f(Some(self.spi_controller)),
             capsules::rng::DRIVER_NUM => f(Some(self.rng)),
+            capsules::usb::usb_ctap::DRIVER_NUM => f(Some(self.usb)),
             capsules::symmetric_encryption::aes::DRIVER_NUM => f(Some(self.aes)),
             capsules::kv_driver::DRIVER_NUM => f(Some(self.kv_driver)),
             _ => f(None),
@@ -404,34 +415,6 @@ unsafe fn setup() -> (
 
     digest.set_sha_client(sha);
 
-    let i2c_master = static_init!(
-        capsules::i2c_master::I2CMasterDriver<'static, lowrisc::i2c::I2c<'static>>,
-        capsules::i2c_master::I2CMasterDriver::new(
-            &peripherals.i2c0,
-            &mut capsules::i2c_master::BUF,
-            board_kernel.create_grant(capsules::i2c_master::DRIVER_NUM, &memory_allocation_cap)
-        )
-    );
-
-    peripherals.i2c0.set_master_client(i2c_master);
-
-    //SPI
-    let mux_spi =
-        components::spi::SpiMuxComponent::new(&peripherals.spi_host0, dynamic_deferred_caller)
-            .finalize(components::spi_mux_component_static!(
-                lowrisc::spi_host::SpiHost
-            ));
-
-    let spi_controller = components::spi::SpiSyscallComponent::new(
-        board_kernel,
-        mux_spi,
-        0,
-        capsules::spi_controller::DRIVER_NUM,
-    )
-    .finalize(components::spi_syscall_component_static!(
-        lowrisc::spi_host::SpiHost
-    ));
-
     peripherals.aes.initialise(
         dynamic_deferred_caller.register(&peripherals.aes).unwrap(), // Unwrap fail = dynamic deferred caller out of slots
     );
@@ -440,15 +423,19 @@ unsafe fn setup() -> (
         .finalize(components::process_printer_text_component_static!());
     PROCESS_PRINTER = Some(process_printer);
 
-    // USB support is currently broken in the OpenTitan hardware
-    // See https://github.com/lowRISC/opentitan/issues/2598 for more details
-    // let usb = components::usb::UsbComponent::new(
-    //     board_kernel,
-    //     capsules::usb::usb_user::DRIVER_NUM,
-    //     &peripherals.usb,
-    // )
-    // .finalize(components::usb_component_static!(earlgrey::usbdev::Usb));
-
+    // Configure USB controller
+    let usb = components::usb_ctap::UsbCtapComponent::new(
+        board_kernel,
+        capsules::usb::usb_ctap::DRIVER_NUM,
+        &peripherals.usb,
+        capsules::usb::usbc_client::MAX_CTRL_PACKET_SIZE_EARLGREY,
+        VENDOR_ID,
+        PRODUCT_ID,
+        STRINGS,
+    )
+    .finalize(components::usb_ctap_component_static!(
+        earlgrey::usbdev::Usb
+    ));
     // Kernel storage region, allocated with the storage_volume!
     // macro in common/utils.rs
     extern "C" {
@@ -691,8 +678,7 @@ unsafe fn setup() -> (
             sha,
             rng,
             lldb: lldb,
-            i2c_master,
-            spi_controller,
+            usb,
             aes,
             kv_driver,
             syscall_filter,
